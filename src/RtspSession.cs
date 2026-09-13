@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 
@@ -10,23 +11,37 @@ namespace V380Decoder.src
         private readonly NetworkStream ns;
         private readonly RtspServer server;
         private readonly bool secure;
+        private readonly object sendLock = new();
         private bool authenticated;
         private Thread readThread;
         private volatile bool playing;
         private volatile bool alive = true;
+        private int closed;
 
         // interleaved channels negotiated in SETUP
         private byte videoCh = 0, audioCh = 2;
 
         // RTP state
-        private ushort videoSeq, audioSeq;
-        private uint videoSsrc = (uint)new Random().Next();
-        private uint audioSsrc = (uint)new Random().Next();
+        private ushort videoSeq = (ushort)Random.Shared.Next(0, 1 << 16);
+        private ushort audioSeq = (ushort)Random.Shared.Next(0, 1 << 16);
+        private readonly uint videoSsrc = (uint)Random.Shared.NextInt64(1, 1L << 32);
+        private readonly uint audioSsrc = (uint)Random.Shared.NextInt64(1, 1L << 32);
+        private readonly byte[] rtcpCname;
 
         // Monotonically increasing synthetic RTP timestamps
-        private uint _videoRtsClock = 0;
+        private uint _videoRtsClock = (uint)Random.Shared.NextInt64(0, 1L << 32);
         private const uint RTP_VIDEO_TICK = 7500;  // ~12 fps at 90 kHz clock
-        private uint _audioRtsClock = 0;
+        private uint _audioRtsClock = (uint)Random.Shared.NextInt64(0, 1L << 32);
+
+        private long audioPacketCount;
+        private long videoPacketCount;
+        private long incomingInterleavedCount;
+        private long lastAudioSenderReportTicks;
+        private long lastVideoSenderReportTicks;
+        private uint audioRtcpPacketCount;
+        private uint audioRtcpOctetCount;
+        private uint videoRtcpPacketCount;
+        private uint videoRtcpOctetCount;
 
         public event Action OnClose;
 
@@ -35,6 +50,7 @@ namespace V380Decoder.src
             this.id = id; this.tcp = tcp; this.server = server;
             this.secure = secure;
             this.authenticated = !secure; // if not secure, auto-authenticate
+            rtcpCname = Encoding.ASCII.GetBytes($"v380decoder-{id}");
             ns = tcp.GetStream();
         }
 
@@ -46,6 +62,8 @@ namespace V380Decoder.src
 
         public void Close()
         {
+            if (Interlocked.Exchange(ref closed, 1) != 0) return;
+
             alive = false;
             playing = false;
             try { tcp.Close(); } catch { }
@@ -55,28 +73,98 @@ namespace V380Decoder.src
         // ── RTSP request reader ──────────────────────────────────
         void ReadLoop()
         {
-            var sb = new StringBuilder();
+            const int MaxRtspMessageSize = 1024 * 1024;
+            var pending = new List<byte>();
             var buf = new byte[4096];
+
             try
             {
                 while (alive)
                 {
                     int n = ns.Read(buf, 0, buf.Length);
                     if (n <= 0) break;
-                    sb.Append(Encoding.ASCII.GetString(buf, 0, n));
-                    string raw = sb.ToString();
-                    int end;
-                    while ((end = raw.IndexOf("\r\n\r\n", StringComparison.Ordinal)) >= 0)
+
+                    for (int i = 0; i < n; i++)
+                        pending.Add(buf[i]);
+
+                    while (alive && pending.Count > 0)
                     {
-                        string req = raw[..(end + 4)];
-                        raw = raw[(end + 4)..];
+                        // Client RTCP reports share this stream with RTSP requests.
+                        if (pending[0] == 0x24)
+                        {
+                            if (pending.Count < 4) break;
+
+                            byte channel = pending[1];
+                            int payloadLength = (pending[2] << 8) | pending[3];
+                            int frameLength = 4 + payloadLength;
+                            if (pending.Count < frameLength) break;
+
+                            long count = Interlocked.Increment(ref incomingInterleavedCount);
+                            if (count <= 3 || count % 100 == 0)
+                                LogUtils.debug($"[RTSP#{id}] incoming RTCP/interleaved channel={channel} len={payloadLength} count={count}");
+
+                            pending.RemoveRange(0, frameLength);
+                            continue;
+                        }
+
+                        int headerEnd = FindRtspHeaderEnd(pending);
+                        if (headerEnd < 0)
+                        {
+                            if (pending.Count > MaxRtspMessageSize)
+                                throw new InvalidDataException("RTSP header exceeds maximum size");
+                            break;
+                        }
+
+                        string header = Encoding.ASCII.GetString(
+                            pending.GetRange(0, headerEnd).ToArray());
+                        int contentLength = ParseContentLength(header);
+                        if (contentLength > MaxRtspMessageSize - headerEnd)
+                            throw new InvalidDataException("RTSP message exceeds maximum size");
+
+                        int requestLength = headerEnd + contentLength;
+                        if (pending.Count < requestLength) break;
+
+                        string req = Encoding.ASCII.GetString(
+                            pending.GetRange(0, requestLength).ToArray());
+                        pending.RemoveRange(0, requestLength);
                         HandleRequest(req);
                     }
-                    sb.Clear(); sb.Append(raw);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (alive)
+                    Console.Error.WriteLine($"[RTSP#{id}] read error: {ex.Message}");
+            }
             finally { Close(); }
+        }
+
+        private static int FindRtspHeaderEnd(List<byte> pending)
+        {
+            for (int i = 0; i + 3 < pending.Count; i++)
+            {
+                if (pending[i] == '\r' && pending[i + 1] == '\n' &&
+                    pending[i + 2] == '\r' && pending[i + 3] == '\n')
+                    return i + 4;
+            }
+
+            return -1;
+        }
+
+        private static int ParseContentLength(string header)
+        {
+            foreach (string line in header.Split("\r\n", StringSplitOptions.None))
+            {
+                if (!line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string value = line[(line.IndexOf(':') + 1)..].Trim();
+                if (!int.TryParse(value, out int length) || length < 0)
+                    throw new InvalidDataException("Invalid RTSP Content-Length");
+                return length;
+            }
+
+            return 0;
         }
 
         // ── Authentication ──────────────────────────────────
@@ -136,7 +224,7 @@ namespace V380Decoder.src
             switch (method)
             {
                 case "OPTIONS":
-                    Reply(cseq, "Public: OPTIONS,DESCRIBE,SETUP,PLAY,TEARDOWN");
+                    Reply(cseq, "Public: OPTIONS,DESCRIBE,SETUP,PLAY,GET_PARAMETER,SET_PARAMETER,TEARDOWN");
                     break;
 
                 case "DESCRIBE":
@@ -150,12 +238,25 @@ namespace V380Decoder.src
 
                 case "SETUP":
                     {
-                        bool isAudio = url.Contains("trackID=1");
+                        bool isAudio = url.Contains("trackID=1", StringComparison.OrdinalIgnoreCase);
                         // Parse interleaved channels from client Transport header
                         // e.g. Transport: RTP/AVP/TCP;unicast;interleaved=0-1
                         byte ch = (byte)(isAudio ? 2 : 0);
-                        var m = System.Text.RegularExpressions.Regex.Match(transport, @"interleaved=(\d+)-(\d+)");
-                        if (m.Success) ch = byte.Parse(m.Groups[1].Value);
+                        var m = System.Text.RegularExpressions.Regex.Match(
+                            transport, @"interleaved=(\d+)-(\d+)",
+                            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        if (m.Success &&
+                            byte.TryParse(m.Groups[1].Value, out byte requestedRtpChannel) &&
+                            byte.TryParse(m.Groups[2].Value, out byte requestedRtcpChannel) &&
+                            requestedRtcpChannel == requestedRtpChannel + 1)
+                        {
+                            ch = requestedRtpChannel;
+                        }
+
+                        if (isAudio)
+                            audioCh = ch;
+                        else
+                            videoCh = ch;
 
                         Reply(cseq,
                             $"Transport: RTP/AVP/TCP;unicast;interleaved={ch}-{ch + 1}",
@@ -164,11 +265,19 @@ namespace V380Decoder.src
                     }
 
                 case "PLAY":
-                    Reply(cseq,
-                        "Session: 1",
-                        $"RTP-Info: url={url}/trackID=0;seq={videoSeq},url={url}/trackID=1;seq={audioSeq}");
-                    playing = true;
-                    Console.Error.WriteLine($"[RTSP#{id}] playing");
+                    if (Reply(cseq,
+                            "Session: 1",
+                            $"RTP-Info: url={url}/trackID=0;seq={videoSeq},url={url}/trackID=1;seq={audioSeq}"))
+                    {
+                        playing = true;
+                        Console.Error.WriteLine($"[RTSP#{id}] playing videoCh={videoCh} audioCh={audioCh}");
+                    }
+                    break;
+
+                case "GET_PARAMETER":
+                case "SET_PARAMETER":
+                    LogUtils.debug($"[RTSP#{id}] {method}");
+                    Reply(cseq, "Session: 1");
                     break;
 
                 case "TEARDOWN":
@@ -182,23 +291,40 @@ namespace V380Decoder.src
             }
         }
 
-        void Reply(string cseq, params string[] headers)
+        bool Reply(string cseq, params string[] headers)
         {
             var sb = new StringBuilder();
             sb.Append($"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n");
             foreach (var h in headers) sb.Append(h + "\r\n");
             sb.Append("\r\n");
-            Send(sb.ToString());
+            return Send(sb.ToString());
         }
 
-        void Send(string s)
+        bool Send(string s)
         {
+            byte[] b = Encoding.ASCII.GetBytes(s);
+            return WriteToClient(b, "RTSP");
+        }
+
+        private bool WriteToClient(byte[] data, string kind)
+        {
+            if (!alive) return false;
+
             try
             {
-                byte[] b = Encoding.ASCII.GetBytes(s);
-                lock (ns) { ns.Write(b, 0, b.Length); ns.Flush(); }
+                lock (sendLock)
+                {
+                    if (!alive) return false;
+                    ns.Write(data, 0, data.Length);
+                }
+                return true;
             }
-            catch { alive = false; }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[RTSP#{id}] {kind} write error: {ex.Message}");
+                Close();
+                return false;
+            }
         }
 
         // ── RTP video push  (H.264/H.265 Annex-B → RTP NAL/FU-A) ──────
@@ -208,7 +334,7 @@ namespace V380Decoder.src
 
             // Use synthetic monotonically increasing RTP timestamps
             // Camera timestamps are unreliable and cause non-monotonic DTS errors
-            _videoRtsClock += RTP_VIDEO_TICK;
+            _videoRtsClock = unchecked(_videoRtsClock + RTP_VIDEO_TICK);
 
             if (server.IsH265)
             {
@@ -314,25 +440,30 @@ namespace V380Decoder.src
         // ── RTP audio push  (PCMA raw samples) ──────────────────
         public void PushAudio(FrameData f)
         {
-            if (!playing) return;
+            if (!playing || f.Payload == null || f.Payload.Length == 0) return;
 
-            // Use synthetic RTP timestamps to prevent DTS discontinuities
-            // 160 samples per chunk at 8 kHz = 20 ms of audio per RTP packet
-            const int CHUNK = 160;
-            for (int off = 0; off < f.Payload.Length; off += CHUNK)
+            // PCMA has one sample per byte. Preserve the camera frame boundary
+            // and advance the 8 kHz RTP clock by the exact sample count.
+            ushort seq = audioSeq;
+            uint timestamp = _audioRtsClock;
+            if (SendRtp(audioCh, 8, seq, timestamp, audioSsrc,
+                        f.Payload, 0, f.Payload.Length, marker: false))
             {
-                int len = Math.Min(CHUNK, f.Payload.Length - off);
-                SendRtp(audioCh, 8, audioSeq++, _audioRtsClock, audioSsrc,
-                        f.Payload, off, len, marker: false);
-                _audioRtsClock += (uint)CHUNK;
+                audioSeq = unchecked((ushort)(audioSeq + 1));
+                _audioRtsClock = unchecked(_audioRtsClock + (uint)f.Payload.Length);
             }
         }
 
         // ── Low-level RTP sender with RTSP interleaved framing ───
         // RFC 2326 §10.12:  $ | channel (1B) | length (2B BE) | RTP packet
-        void SendRtp(byte channel, byte pt, ushort seq, uint ts, uint ssrc,
+        bool SendRtp(byte channel, byte pt, ushort seq, uint ts, uint ssrc,
                      byte[] payload, int offset, int length, bool marker)
         {
+            if (offset < 0 || length < 0 || offset > payload.Length - length)
+                throw new ArgumentOutOfRangeException(nameof(length));
+            if (length > ushort.MaxValue - 12)
+                throw new ArgumentOutOfRangeException(nameof(length), "RTP packet is too large for RTSP interleaving");
+
             var rtp = new byte[12 + length];
             rtp[0] = 0x80;
             rtp[1] = (byte)((marker ? 0x80 : 0) | (pt & 0x7F));
@@ -344,15 +475,131 @@ namespace V380Decoder.src
             rtp[10] = (byte)(ssrc >> 8); rtp[11] = (byte)ssrc;
             Array.Copy(payload, offset, rtp, 12, length);
 
-            var frame = new byte[4 + rtp.Length];
+            bool isAudio = pt == 8;
+            if (!SendInterleaved(channel, rtp, isAudio ? "AUDIO RTP" : "VIDEO RTP"))
+                return false;
+
+            uint senderReportTimestamp;
+            long count;
+            long logInterval;
+            if (isAudio)
+            {
+                audioRtcpPacketCount = unchecked(audioRtcpPacketCount + 1);
+                audioRtcpOctetCount = unchecked(audioRtcpOctetCount + (uint)length);
+                senderReportTimestamp = unchecked(ts + (uint)length);
+                count = Interlocked.Increment(ref audioPacketCount);
+                logInterval = 500;
+            }
+            else
+            {
+                videoRtcpPacketCount = unchecked(videoRtcpPacketCount + 1);
+                videoRtcpOctetCount = unchecked(videoRtcpOctetCount + (uint)length);
+                senderReportTimestamp = ts;
+                count = Interlocked.Increment(ref videoPacketCount);
+                logInterval = 1000;
+            }
+
+            if (count % logInterval == 0)
+                LogUtils.debug($"[RTSP#{id}] {(isAudio ? "AUDIO" : "VIDEO")} seq={seq} ts={ts} len={length} count={count}");
+
+            MaybeSendSenderReport(isAudio, senderReportTimestamp);
+
+            return true;
+        }
+
+        private bool SendInterleaved(byte channel, byte[] payload, string kind)
+        {
+            if (payload.Length > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(payload), "Interleaved payload is too large");
+
+            var frame = new byte[4 + payload.Length];
             frame[0] = 0x24; // '$'
             frame[1] = channel;
-            frame[2] = (byte)(rtp.Length >> 8);
-            frame[3] = (byte)rtp.Length;
-            Array.Copy(rtp, 0, frame, 4, rtp.Length);
+            frame[2] = (byte)(payload.Length >> 8);
+            frame[3] = (byte)payload.Length;
+            Array.Copy(payload, 0, frame, 4, payload.Length);
+            return WriteToClient(frame, kind);
+        }
 
-            try { lock (ns) { ns.Write(frame, 0, frame.Length); ns.Flush(); } }
-            catch { alive = false; }
+        // RTCP Sender Reports map each track's independent RTP clock to the
+        // same wall clock. VLC uses this mapping for stable A/V synchronization.
+        private void MaybeSendSenderReport(bool isAudio, uint rtpTimestamp)
+        {
+            const long SenderReportIntervalSeconds = 5;
+            long nowTicks = Stopwatch.GetTimestamp();
+            long lastTicks = isAudio
+                ? Volatile.Read(ref lastAudioSenderReportTicks)
+                : Volatile.Read(ref lastVideoSenderReportTicks);
+
+            if (lastTicks != 0 &&
+                nowTicks - lastTicks < Stopwatch.Frequency * SenderReportIntervalSeconds)
+                return;
+
+            if (isAudio)
+                Volatile.Write(ref lastAudioSenderReportTicks, nowTicks);
+            else
+                Volatile.Write(ref lastVideoSenderReportTicks, nowTicks);
+
+            uint ssrc = isAudio ? audioSsrc : videoSsrc;
+            uint packetCount = isAudio ? audioRtcpPacketCount : videoRtcpPacketCount;
+            uint octetCount = isAudio ? audioRtcpOctetCount : videoRtcpOctetCount;
+            byte channel = (byte)((isAudio ? audioCh : videoCh) + 1);
+            byte[] report = BuildSenderReport(ssrc, rtpTimestamp, packetCount, octetCount);
+
+            if (SendInterleaved(channel, report, isAudio ? "AUDIO RTCP" : "VIDEO RTCP"))
+                LogUtils.debug($"[RTSP#{id}] RTCP SR {(isAudio ? "audio" : "video")} channel={channel} rtpTs={rtpTimestamp} packets={packetCount}");
+        }
+
+        private byte[] BuildSenderReport(uint ssrc, uint rtpTimestamp,
+                                         uint packetCount, uint octetCount)
+        {
+            const int senderReportLength = 28;
+            int sdesLength = (4 + 4 + 2 + rtcpCname.Length + 1 + 3) & ~3;
+            var compound = new byte[senderReportLength + sdesLength];
+
+            // Sender Report: V=2, RC=0, PT=200, length=6.
+            compound[0] = 0x80;
+            compound[1] = 200;
+            WriteUInt16BigEndian(compound, 2, 6);
+            WriteUInt32BigEndian(compound, 4, ssrc);
+
+            long utcTicksSinceUnixEpoch = DateTime.UtcNow.Ticks - DateTime.UnixEpoch.Ticks;
+            ulong ntpSeconds = (ulong)(utcTicksSinceUnixEpoch / TimeSpan.TicksPerSecond) + 2208988800UL;
+            ulong ticksWithinSecond = (ulong)(utcTicksSinceUnixEpoch % TimeSpan.TicksPerSecond);
+            uint ntpFraction = (uint)((ticksWithinSecond << 32) / TimeSpan.TicksPerSecond);
+
+            WriteUInt32BigEndian(compound, 8, (uint)ntpSeconds);
+            WriteUInt32BigEndian(compound, 12, ntpFraction);
+            WriteUInt32BigEndian(compound, 16, rtpTimestamp);
+            WriteUInt32BigEndian(compound, 20, packetCount);
+            WriteUInt32BigEndian(compound, 24, octetCount);
+
+            // SDES with a shared CNAME links audio and video SSRCs.
+            int sdesOffset = senderReportLength;
+            compound[sdesOffset] = 0x81; // V=2, source count=1
+            compound[sdesOffset + 1] = 202;
+            WriteUInt16BigEndian(compound, sdesOffset + 2,
+                (ushort)(sdesLength / 4 - 1));
+            WriteUInt32BigEndian(compound, sdesOffset + 4, ssrc);
+            compound[sdesOffset + 8] = 1; // CNAME
+            compound[sdesOffset + 9] = (byte)rtcpCname.Length;
+            Array.Copy(rtcpCname, 0, compound, sdesOffset + 10, rtcpCname.Length);
+
+            return compound;
+        }
+
+        private static void WriteUInt16BigEndian(byte[] buffer, int offset, ushort value)
+        {
+            buffer[offset] = (byte)(value >> 8);
+            buffer[offset + 1] = (byte)value;
+        }
+
+        private static void WriteUInt32BigEndian(byte[] buffer, int offset, uint value)
+        {
+            buffer[offset] = (byte)(value >> 24);
+            buffer[offset + 1] = (byte)(value >> 16);
+            buffer[offset + 2] = (byte)(value >> 8);
+            buffer[offset + 3] = (byte)value;
         }
     }
 }

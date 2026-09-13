@@ -60,8 +60,8 @@ namespace V380Decoder.src
                     int id = Interlocked.Increment(ref nextId);
                     var s = new RtspSession(id, tcp, this, secure);
                     sessions[id] = s;
-                    s.Start();
                     s.OnClose += () => sessions.TryRemove(id, out _);
+                    s.Start();
                 }
                 catch { }
             }

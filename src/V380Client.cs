@@ -448,6 +448,56 @@ namespace V380Decoder.src
                         }
                     }
 
+                    // AUDIO old V380 protocol: IMA ADPCM 8 kHz
+                    else if (type == 0x16)
+                    {
+                        if (curFrame == 0)
+                        {
+                            audioFrags.Clear();
+                            audioTotal = totalFrame;
+                        }
+
+                        if (totalFrame != audioTotal)
+                        {
+                            audioFrags.Clear();
+                            audioTotal = totalFrame;
+                        }
+
+                        for (int i = 0; i < payLen; i++)
+                            audioFrags.Add(payloadBuf[i]);
+
+                        if (curFrame != totalFrame - 1)
+                            continue;
+
+                        byte[] full = audioFrags.ToArray();
+                        audioFrags.Clear();
+
+                        byte[] payload = DecodeOldImaAudio(full);
+
+                        if (payload.Length == 0)
+                            continue;
+
+                        var fd = new FrameData
+                        {
+                            RawType = type,
+                            FrameId = 0,
+                            FrameType = 0,
+                            FrameRate = 0,
+                            Timestamp = 0,
+                            Payload = payload
+                        };
+
+                        if (mode == OutputMode.Audio)
+                        {
+                            stdout.Write(payload, 0, payload.Length);
+                            stdout.Flush();
+                        }
+                        else if (mode == OutputMode.Rtsp)
+                        {
+                            rtsp?.PushAudio(fd);
+                        }
+                    }
+
                     // AUDIO  0x1A
                     else if (type == 0x1A)
                     {
@@ -517,6 +567,127 @@ namespace V380Decoder.src
             {
                 Console.Error.WriteLine($"[RECV] {ex.Message}");
             }
+        }
+
+        private static readonly int[] ImaStepTable =
+        {
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+            19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+            50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+            130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+            337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+            876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+            2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+            5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+            15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+        };
+
+        private static readonly int[] ImaIndexTable =
+        {
+            -1, -1, -1, -1, 2, 4, 6, 8
+        };
+
+        private int oldImaPredictor = 0;
+        private int oldImaIndex = 0;
+
+        private byte[] DecodeOldImaAudio(byte[] full)
+        {
+            // Original prsyahmi/v380 strips exactly 20 bytes
+            // before feeding the stream to adpcm_ima_ws.
+            const int headerSize = 20;
+
+            if (full.Length <= headerSize)
+                return Array.Empty<byte>();
+
+            int dataSize = full.Length - headerSize;
+
+            // 1 ADPCM byte -> 2 PCM samples -> 2 G.711 A-law bytes
+            byte[] output = new byte[dataSize * 2];
+            int outPos = 0;
+
+            for (int pos = headerSize; pos < full.Length; pos++)
+            {
+                byte b = full[pos];
+
+                // Westwood IMA: low nibble is the first sample
+                output[outPos++] = DecodeOldImaNibble(b & 0x0F);
+                output[outPos++] = DecodeOldImaNibble((b >> 4) & 0x0F);
+            }
+
+            return output;
+        }
+
+        private byte DecodeOldImaNibble(int nibble)
+        {
+            int step = ImaStepTable[oldImaIndex];
+
+            int diff = step >> 3;
+
+            if ((nibble & 4) != 0)
+                diff += step;
+
+            if ((nibble & 2) != 0)
+                diff += step >> 1;
+
+            if ((nibble & 1) != 0)
+                diff += step >> 2;
+
+            if ((nibble & 8) != 0)
+                oldImaPredictor -= diff;
+            else
+                oldImaPredictor += diff;
+
+            oldImaPredictor = Math.Clamp(oldImaPredictor, -32768, 32767);
+
+            oldImaIndex += ImaIndexTable[nibble & 7];
+            oldImaIndex = Math.Clamp(oldImaIndex, 0, 88);
+
+            return Pcm16ToALaw((short)oldImaPredictor);
+        }
+
+        private static byte Pcm16ToALaw(short sample)
+        {
+            int pcm = sample;
+            int mask;
+
+            if (pcm >= 0)
+            {
+                mask = 0xD5;
+            }
+            else
+            {
+                mask = 0x55;
+                pcm = -pcm - 8;
+
+                if (pcm < 0)
+                    pcm = 0;
+            }
+
+            if (pcm > 32635)
+                pcm = 32635;
+
+            int[] segEnd =
+            {
+                0xFF, 0x1FF, 0x3FF, 0x7FF,
+                0xFFF, 0x1FFF, 0x3FFF, 0x7FFF
+            };
+
+            int seg = 0;
+
+            while (seg < 8 && pcm > segEnd[seg])
+                seg++;
+
+            if (seg >= 8)
+                return (byte)(0x7F ^ mask);
+
+            int aval = seg << 4;
+
+            if (seg < 2)
+                aval |= (pcm >> 4) & 0x0F;
+            else
+                aval |= (pcm >> (seg + 3)) & 0x0F;
+
+            return (byte)(aval ^ mask);
         }
 
         private void DecryptVideoFrame(byte[] data, int length)

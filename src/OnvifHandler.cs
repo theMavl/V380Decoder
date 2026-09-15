@@ -799,16 +799,9 @@ namespace V380Decoder.src
       return match.Success ? System.Net.WebUtility.HtmlDecode(match.Groups[1].Value.Trim()) : string.Empty;
     }
 
-    private static string BuildProfile(V380StreamProfile profile, string elementName) => $@"
-      <{elementName} token=""{profile.ProfileToken}"" fixed=""true"">
-        <tt:Name>{profile.DisplayName}</tt:Name>
-        <tt:VideoSourceConfiguration token=""{profile.VideoSourceConfigToken}"">
-          <tt:Name>VideoSource</tt:Name>
-          <tt:UseCount>1</tt:UseCount>
-          <tt:SourceToken>{profile.VideoSourceToken}</tt:SourceToken>
-          <tt:Bounds x=""0"" y=""0"" width=""{profile.Width}"" height=""{profile.Height}""/>
-        </tt:VideoSourceConfiguration>
-        {BuildVideoEncoderConfiguration(profile, "tt:VideoEncoderConfiguration")}
+    private static string BuildProfile(V380StreamProfile profile, string elementName)
+    {
+      string audioConfigurations = profile.HasAudio ? @"
         <tt:AudioSourceConfiguration token=""AudioSrcCfg_1"">
           <tt:Name>AudioSource</tt:Name>
           <tt:UseCount>1</tt:UseCount>
@@ -821,7 +814,19 @@ namespace V380Decoder.src
           <tt:Bitrate>64</tt:Bitrate>
           <tt:SampleRate>8</tt:SampleRate>
           <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-        </tt:AudioEncoderConfiguration>
+        </tt:AudioEncoderConfiguration>" : string.Empty;
+
+      return $@"
+      <{elementName} token=""{profile.ProfileToken}"" fixed=""true"">
+        <tt:Name>{profile.DisplayName}</tt:Name>
+        <tt:VideoSourceConfiguration token=""{profile.VideoSourceConfigToken}"">
+          <tt:Name>VideoSource</tt:Name>
+          <tt:UseCount>1</tt:UseCount>
+          <tt:SourceToken>{profile.VideoSourceToken}</tt:SourceToken>
+          <tt:Bounds x=""0"" y=""0"" width=""{profile.Width}"" height=""{profile.Height}""/>
+        </tt:VideoSourceConfiguration>
+        {BuildVideoEncoderConfiguration(profile, "tt:VideoEncoderConfiguration")}
+        {audioConfigurations}
         <tt:PTZConfiguration token=""PTZConfig_1"">
           <tt:Name>PTZ</tt:Name>
           <tt:UseCount>1</tt:UseCount>
@@ -830,6 +835,7 @@ namespace V380Decoder.src
           <tt:DefaultPTZTimeout>PT1S</tt:DefaultPTZTimeout>
         </tt:PTZConfiguration>
       </{elementName}>";
+    }
 
     private static string BuildVideoEncoderConfiguration(
       V380StreamProfile profile,

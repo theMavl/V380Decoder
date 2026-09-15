@@ -8,6 +8,7 @@ namespace V380Decoder.src
         public int Height { get; init; }
         public int FrameRate { get; init; }
         public string Encoding { get; init; } = string.Empty;
+        public bool HasAudio { get; init; } = true;
 
         public string ProfileToken => $"Profile_{Quality}";
         public string VideoSourceToken => "VideoSource_1";

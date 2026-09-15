@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
@@ -8,8 +9,8 @@ using System.Text.Json;
 namespace V380Decoder.src
 {
     /// <summary>
-    /// Feeds elementary V380 video/audio into FFmpeg and publishes the muxed
-    /// stream to MediaMTX.  FFmpeg owns timestamps, pacing and RTP muxing;
+    /// Feeds raw V380 media to GStreamer, which decodes legacy IMA audio,
+    /// converts it to G.711 and publishes both tracks to MediaMTX.
     /// MediaMTX owns RTSP sessions, RTCP and client fan-out.
     /// </summary>
     public sealed class MediaMtxBridge : IMediaSink, IDisposable
@@ -21,19 +22,27 @@ namespace V380Decoder.src
         private readonly bool secure;
         private readonly string username;
         private readonly string password;
+        private readonly string audioDumpPath;
         private readonly object stateLock = new();
         private readonly Dictionary<string, StreamState> streams = new(StringComparer.Ordinal);
 
         private Process mediaMtxProcess;
+        private FileStream audioDumpStream;
         private string configDirectory;
         private int disposed;
 
-        public MediaMtxBridge(int rtspPort, bool secure, string username, string password)
+        public MediaMtxBridge(
+            int rtspPort,
+            bool secure,
+            string username,
+            string password,
+            string audioDumpPath = "")
         {
             this.rtspPort = rtspPort;
             this.secure = secure;
             this.username = username;
             this.password = password;
+            this.audioDumpPath = audioDumpPath;
         }
 
         public void Start()
@@ -81,6 +90,22 @@ namespace V380Decoder.src
 
             WaitForMediaMtx();
 
+            if (!string.IsNullOrWhiteSpace(audioDumpPath))
+            {
+                string fullDumpPath = Path.GetFullPath(audioDumpPath);
+                string parent = Path.GetDirectoryName(fullDumpPath);
+                if (!string.IsNullOrEmpty(parent))
+                    Directory.CreateDirectory(parent);
+                audioDumpStream = new FileStream(
+                    fullDumpPath,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    64 * 1024,
+                    FileOptions.SequentialScan);
+                Console.Error.WriteLine($"[AUDIO-DUMP] recording raw IMA WAV blocks to {fullDumpPath}");
+            }
+
             string address = $"rtsp://{NetworkHelper.GetLocalIPAddress()}:{rtspPort}/live";
             Console.Error.WriteLine($"[RTSP] {address}{(secure ? " (authentication enabled)" : string.Empty)}");
         }
@@ -94,7 +119,7 @@ namespace V380Decoder.src
         public void Reset()
             => Reset("live");
 
-        public IMediaSink CreateSink(string path)
+        public IMediaSink CreateSink(string path, bool includeAudio = true)
         {
             if (string.IsNullOrWhiteSpace(path) ||
                 path.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_')))
@@ -103,7 +128,7 @@ namespace V380Decoder.src
             lock (stateLock)
             {
                 ThrowIfDisposed();
-                GetStreamLocked(path);
+                GetStreamLocked(path).AudioEnabled = includeAudio;
             }
             return new PathSink(this, path);
         }
@@ -111,6 +136,8 @@ namespace V380Decoder.src
         private void PushVideo(string path, FrameData frame)
         {
             if (frame?.Payload == null || frame.Payload.Length == 0) return;
+            bool isH265 = frame.RawType == 0x28 || frame.RawType == 0x29;
+            bool isKeyframe = frame.IsKeyframe;
 
             Publisher activePublisher;
             lock (stateLock)
@@ -121,9 +148,6 @@ namespace V380Decoder.src
 
                 if (stream.Publisher == null)
                 {
-                    bool isH265 = frame.RawType == 0x28 || frame.RawType == 0x29;
-                    bool isKeyframe = frame.RawType == 0x00 || frame.RawType == 0x28;
-
                     if (!stream.HaveVideoKeyframe)
                     {
                         if (!isKeyframe) return;
@@ -132,8 +156,8 @@ namespace V380Decoder.src
                     }
 
                     if (stream.PendingVideo.Count >= MaxPendingVideoFrames)
-                        throw new IOException("FFmpeg publisher did not start before the video queue filled");
-                    stream.PendingVideo.Add(frame.Payload);
+                        throw new IOException("GStreamer publisher did not start before the video queue filled");
+                    stream.PendingVideo.Add(frame);
                     TryStartPublisherLocked(path, stream);
                     return;
                 }
@@ -141,47 +165,77 @@ namespace V380Decoder.src
                 activePublisher = stream.Publisher;
             }
 
-            if (!activePublisher.TryPushVideo(frame.Payload))
-                throw new IOException("FFmpeg video publisher stopped or its queue filled");
+            if (!activePublisher.TryPushVideo(frame))
+                throw new IOException("GStreamer video publisher stopped or its queue filled");
         }
 
         private void PushAudio(string path, FrameData frame)
         {
             if (frame?.Payload == null || frame.Payload.Length == 0) return;
 
-            Publisher activePublisher;
+            Publisher activePublisher = null;
+            FrameData directFrame = null;
             lock (stateLock)
             {
                 ThrowIfDisposed();
                 EnsureMediaMtxAlive();
                 StreamState stream = GetStreamLocked(path);
+                if (!stream.AudioEnabled) return;
+
+                switch (frame.RawType)
+                {
+                    case 0x16:
+                        if (frame.Payload.Length < 64 || frame.Payload.Length > 8192 ||
+                            frame.Payload[2] > 88 ||
+                            frame.Payload[3] != 0)
+                            throw new InvalidDataException("Invalid V380 IMA WAV block");
+                        EnsureAudioFormat(stream, "adpcm_ima_wav", frame.Payload.Length);
+                        directFrame = frame;
+                        audioDumpStream?.Write(frame.Payload, 0, frame.Payload.Length);
+                        break;
+                    case 0x1A:
+                        EnsureAudioFormat(stream, "alaw");
+                        directFrame = frame;
+                        break;
+                    default:
+                        throw new InvalidDataException($"Unsupported V380 audio type 0x{frame.RawType:X2}");
+                }
 
                 if (stream.Publisher == null)
                 {
-                    switch (frame.RawType)
-                    {
-                        case 0x16:
-                            throw new InvalidDataException(
-                                "Raw V380 ADPCM reached the RTSP publisher without decoding");
-                        case 0x1A:
-                            stream.AudioInputFormat = "alaw";
-                            break;
-                        default:
-                            throw new InvalidDataException($"Unsupported V380 audio type 0x{frame.RawType:X2}");
-                    }
-
-                    if (stream.PendingAudio.Count >= MaxPendingAudioFrames)
-                        throw new IOException("FFmpeg publisher did not start before the audio queue filled");
-                    stream.PendingAudio.Add(frame.Payload);
+                    QueuePendingAudio(stream, directFrame);
                     TryStartPublisherLocked(path, stream);
                     return;
                 }
-
                 activePublisher = stream.Publisher;
             }
 
-            if (!activePublisher.TryPushAudio(frame.Payload))
-                throw new IOException("FFmpeg audio publisher stopped or its queue filled");
+            if (!activePublisher.TryPushAudio(directFrame))
+                throw new IOException("GStreamer audio publisher stopped or its queue filled");
+        }
+
+        private static void QueuePendingAudio(StreamState stream, FrameData frame)
+        {
+            if (stream.PendingAudio.Count >= MaxPendingAudioFrames)
+                throw new IOException("GStreamer publisher did not start before the audio queue filled");
+            stream.PendingAudio.Add(frame);
+        }
+
+        private static void EnsureAudioFormat(
+            StreamState stream,
+            string format,
+            int blockAlign = 0)
+        {
+            if (stream.AudioInputFormat == null)
+            {
+                stream.AudioInputFormat = format;
+                stream.AudioBlockAlign = blockAlign;
+                return;
+            }
+            if (!string.Equals(stream.AudioInputFormat, format, StringComparison.Ordinal))
+                throw new InvalidDataException("V380 audio codec changed while streaming");
+            if (stream.AudioBlockAlign != blockAlign)
+                throw new InvalidDataException("V380 audio block size changed while streaming");
         }
 
         private void Reset(string path)
@@ -196,6 +250,7 @@ namespace V380Decoder.src
                 stream.Publisher = null;
                 stream.VideoInputFormat = null;
                 stream.AudioInputFormat = null;
+                stream.AudioBlockAlign = 0;
                 stream.HaveVideoKeyframe = false;
                 stream.PendingVideo.Clear();
                 stream.PendingAudio.Clear();
@@ -208,26 +263,37 @@ namespace V380Decoder.src
 
         private void TryStartPublisherLocked(string path, StreamState stream)
         {
-            if (stream.Publisher != null || !stream.HaveVideoKeyframe || stream.AudioInputFormat == null)
+            if (stream.Publisher != null || !stream.HaveVideoKeyframe ||
+                (stream.AudioEnabled &&
+                    (stream.AudioInputFormat == null || stream.PendingAudio.Count == 0)))
                 return;
+
+            ulong mediaOriginTimestamp = stream.PendingVideo
+                .Concat(stream.PendingAudio)
+                .Where(frame => frame.Timestamp != 0)
+                .Select(frame => frame.Timestamp)
+                .DefaultIfEmpty(0UL)
+                .Min();
 
             var newPublisher = new Publisher(
                 rtspPort,
                 path,
                 stream.VideoInputFormat,
-                stream.AudioInputFormat);
+                stream.AudioEnabled ? stream.AudioInputFormat : "none",
+                stream.AudioEnabled ? stream.AudioBlockAlign : 0,
+                mediaOriginTimestamp);
 
             try
             {
-                foreach (byte[] frame in stream.PendingVideo)
+                foreach (FrameData frame in stream.PendingVideo)
                 {
                     if (!newPublisher.TryPushVideo(frame))
-                        throw new IOException("Unable to queue initial video for FFmpeg");
+                        throw new IOException("Unable to queue initial video for GStreamer");
                 }
-                foreach (byte[] frame in stream.PendingAudio)
+                foreach (FrameData frame in stream.PendingAudio)
                 {
                     if (!newPublisher.TryPushAudio(frame))
-                        throw new IOException("Unable to queue initial audio for FFmpeg");
+                        throw new IOException("Unable to queue initial audio for GStreamer");
                 }
 
                 stream.Publisher = newPublisher;
@@ -241,8 +307,8 @@ namespace V380Decoder.src
             stream.PendingVideo.Clear();
             stream.PendingAudio.Clear();
             Console.Error.WriteLine(
-                $"[PUBLISH:{path}] FFmpeg started video={stream.VideoInputFormat} " +
-                $"audio={stream.AudioInputFormat}");
+                $"[PUBLISH:{path}] GStreamer started video={stream.VideoInputFormat} " +
+                $"audio={(stream.AudioEnabled ? stream.AudioInputFormat : "none")}");
         }
 
         private StreamState GetStreamLocked(string path)
@@ -367,6 +433,7 @@ namespace V380Decoder.src
 
             Publisher[] oldPublishers;
             Process oldMediaMtx;
+            FileStream oldAudioDump;
             string oldConfigDirectory;
             lock (stateLock)
             {
@@ -377,6 +444,8 @@ namespace V380Decoder.src
                 streams.Clear();
                 oldMediaMtx = mediaMtxProcess;
                 mediaMtxProcess = null;
+                oldAudioDump = audioDumpStream;
+                audioDumpStream = null;
                 oldConfigDirectory = configDirectory;
                 configDirectory = null;
             }
@@ -384,6 +453,7 @@ namespace V380Decoder.src
             foreach (Publisher publisher in oldPublishers)
                 publisher.Dispose();
             StopProcess(oldMediaMtx);
+            oldAudioDump?.Dispose();
 
             if (!string.IsNullOrEmpty(oldConfigDirectory))
             {
@@ -406,12 +476,14 @@ namespace V380Decoder.src
 
         private sealed class StreamState
         {
-            public readonly List<byte[]> PendingVideo = new();
-            public readonly List<byte[]> PendingAudio = new();
+            public readonly List<FrameData> PendingVideo = new();
+            public readonly List<FrameData> PendingAudio = new();
             public Publisher Publisher;
             public string VideoInputFormat;
             public string AudioInputFormat;
+            public int AudioBlockAlign;
             public bool HaveVideoKeyframe;
+            public bool AudioEnabled = true;
         }
 
         private sealed class PathSink : IMediaSink
@@ -432,72 +504,76 @@ namespace V380Decoder.src
 
         private sealed class Publisher : IDisposable
         {
-            // These queues must hold every frame accepted by the corresponding
-            // pre-publisher queues, plus a small connection-startup margin.
-            private const int VideoQueueCapacity = MaxPendingVideoFrames + 32;
-            private const int AudioQueueCapacity = MaxPendingAudioFrames + 32;
+            private const int BridgeHeaderSize = 28;
+            private const int PacketVideo = 1;
+            private const int PacketAudio = 2;
+            private const int KeyframeFlag = 1;
+            private const long NanosecondsPerSecond = 1_000_000_000;
+            private const int QueueCapacity =
+                MaxPendingVideoFrames + MaxPendingAudioFrames + 64;
 
-            private readonly BlockingCollection<byte[]> videoQueue = new(VideoQueueCapacity);
-            private readonly BlockingCollection<byte[]> audioQueue = new(AudioQueueCapacity);
-            private readonly TcpListener videoListener;
-            private readonly TcpListener audioListener;
-            private readonly Thread videoWriterThread;
-            private readonly Thread audioWriterThread;
+            private readonly BlockingCollection<BridgePacket> queue = new(QueueCapacity);
+            private readonly object timestampLock = new();
+            private readonly Stream input;
+            private readonly Thread writerThread;
             private readonly Process process;
-            private TcpClient videoClient;
-            private TcpClient audioClient;
+            private readonly string audioFormat;
+            private readonly int audioBlockAlign;
+            private readonly ulong mediaOriginTimestamp;
+            private long audioSampleNumber;
+            private ulong audioStartPts;
+            private ulong lastVideoPts;
+            private bool audioStarted;
+            private bool videoStarted;
+            private int writerFailed;
             private int disposed;
 
-            public Publisher(int rtspPort, string path, string videoFormat, string audioFormat)
+            public Publisher(
+                int rtspPort,
+                string path,
+                string videoFormat,
+                string audioFormat,
+                int audioBlockAlign,
+                ulong mediaOriginTimestamp)
             {
-                videoListener = CreateListener(out int videoPort);
-                audioListener = CreateListener(out int audioPort);
-
-                videoWriterThread = CreateWriterThread(
-                    "v380-ffmpeg-video", videoListener, videoQueue, client => videoClient = client);
-                audioWriterThread = CreateWriterThread(
-                    "v380-ffmpeg-audio", audioListener, audioQueue, client => audioClient = client);
-                videoWriterThread.Start();
-                audioWriterThread.Start();
+                this.audioFormat = audioFormat;
+                this.audioBlockAlign = audioBlockAlign;
+                this.mediaOriginTimestamp = mediaOriginTimestamp;
+                if (audioFormat == "adpcm_ima_wav" &&
+                    (audioBlockAlign < 64 || audioBlockAlign > 8192))
+                    throw new ArgumentOutOfRangeException(
+                        nameof(audioBlockAlign),
+                        "IMA WAV block alignment is outside the GStreamer decoder range");
+                if (audioFormat != "adpcm_ima_wav" &&
+                    audioFormat != "alaw" &&
+                    audioFormat != "none")
+                {
+                    throw new ArgumentException(
+                        $"Unsupported audio input format: {audioFormat}",
+                        nameof(audioFormat));
+                }
 
                 var startInfo = new ProcessStartInfo
                 {
-                    FileName = "ffmpeg",
+                    FileName = Path.Combine(AppContext.BaseDirectory, "v380-gst-bridge"),
                     UseShellExecute = false,
+                    RedirectStandardInput = true,
                     RedirectStandardError = true,
                     RedirectStandardOutput = true,
                     CreateNoWindow = true
                 };
-
-                AddArguments(startInfo,
-                    "-hide_banner", "-nostats", "-loglevel", "warning",
-                    "-fflags", "+genpts+nobuffer",
-                    "-thread_queue_size", "64",
-                    "-use_wallclock_as_timestamps", "1",
-                    "-probesize", "1000000", "-analyzeduration", "1000000",
-                    "-f", videoFormat,
-                    "-i", $"tcp://127.0.0.1:{videoPort}",
-                    "-thread_queue_size", "64",
-                    "-f", audioFormat,
-                    "-ar", "8000", "-ac", "1",
-                    "-i", $"tcp://127.0.0.1:{audioPort}",
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-c:v", "copy",
-                    // Old V380 ADPCM has already been decoded and paced by
-                    // OldImaAudioDecoder. Preserve its 8 kHz PCMA samples and
-                    // timestamps generated from the sample count.
-                    "-c:a", "copy",
-                    "-fps_mode", "passthrough",
-                    "-max_interleave_delta", "100000",
-                    "-muxdelay", "0",
-                    "-f", "rtsp", "-rtsp_transport", "tcp",
-                    $"rtsp://127.0.0.1:{rtspPort}/{path}");
+                AddArguments(
+                    startInfo,
+                    "--url", $"rtsp://127.0.0.1:{rtspPort}/{path}",
+                    "--video", videoFormat,
+                    "--audio", audioFormat,
+                    "--audio-block-align", audioBlockAlign.ToString());
 
                 process = new Process { StartInfo = startInfo };
                 try
                 {
                     if (!process.Start())
-                        throw new InvalidOperationException("Failed to start FFmpeg publisher");
+                        throw new InvalidOperationException("Failed to start GStreamer publisher");
                 }
                 catch
                 {
@@ -505,70 +581,140 @@ namespace V380Decoder.src
                     throw;
                 }
 
-                StartLogPump(process.StandardError, "[FFMPEG]");
-                StartLogPump(process.StandardOutput, "[FFMPEG]");
-            }
-
-            public bool TryPushVideo(byte[] payload) =>
-                IsAlive() && videoQueue.TryAdd(payload);
-
-            public bool TryPushAudio(byte[] payload) =>
-                IsAlive() && audioQueue.TryAdd(payload);
-
-            private bool IsAlive() =>
-                Volatile.Read(ref disposed) == 0 && !process.HasExited;
-
-            private Thread CreateWriterThread(
-                string name,
-                TcpListener listener,
-                BlockingCollection<byte[]> queue,
-                Action<TcpClient> setClient)
-            {
-                return new Thread(() =>
-                {
-                    try
-                    {
-                        TcpClient client = listener.AcceptTcpClient();
-                        client.NoDelay = true;
-                        client.SendBufferSize = 64 * 1024;
-                        setClient(client);
-                        using NetworkStream stream = client.GetStream();
-                        foreach (byte[] payload in queue.GetConsumingEnumerable())
-                            stream.Write(payload, 0, payload.Length);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (Volatile.Read(ref disposed) == 0)
-                            Console.Error.WriteLine($"[PUBLISH] {name} stopped: {ex.Message}");
-                    }
-                })
+                input = process.StandardInput.BaseStream;
+                StartLogPump(process.StandardError, "[GSTREAMER]");
+                StartLogPump(process.StandardOutput, "[GSTREAMER]");
+                writerThread = new Thread(PumpInput)
                 {
                     IsBackground = true,
-                    Name = name
+                    Name = "v380-gstreamer-input"
                 };
+                writerThread.Start();
             }
 
-            private static TcpListener CreateListener(out int port)
+            public bool TryPushVideo(FrameData frame)
             {
-                var listener = new TcpListener(IPAddress.Loopback, 0);
-                listener.Start(1);
-                port = ((IPEndPoint)listener.LocalEndpoint).Port;
-                return listener;
+                if (!IsAlive()) return false;
+
+                BridgePacket packet;
+                lock (timestampLock)
+                {
+                    if (frame.FrameRate == 0)
+                        return false;
+                    int frameRate = frame.FrameRate;
+                    ulong duration = UnitsToNanoseconds(1, frameRate);
+                    ulong pts = TimestampToNanoseconds(frame.Timestamp);
+                    if (videoStarted && pts <= lastVideoPts)
+                        return false;
+                    lastVideoPts = pts;
+                    videoStarted = true;
+                    packet = new BridgePacket(
+                        PacketVideo,
+                        frame.IsKeyframe ? KeyframeFlag : 0,
+                        pts,
+                        duration,
+                        frame.Payload);
+                }
+                return queue.TryAdd(packet);
+            }
+
+            public bool TryPushAudio(FrameData frame)
+            {
+                if (audioFormat == "none" || !IsAlive() ||
+                    frame?.Payload == null || frame.Payload.Length == 0)
+                    return false;
+
+                BridgePacket packet;
+                lock (timestampLock)
+                {
+                    int sampleCount;
+                    if (audioFormat == "adpcm_ima_wav")
+                    {
+                        if (frame.Payload.Length != audioBlockAlign)
+                            return false;
+                        sampleCount = checked(1 + (frame.Payload.Length - 4) * 2);
+                    }
+                    else
+                    {
+                        sampleCount = frame.Payload.Length;
+                    }
+                    if (!audioStarted)
+                    {
+                        audioStartPts = TimestampToNanoseconds(frame.Timestamp);
+                        audioStarted = true;
+                    }
+                    long firstSample = audioSampleNumber;
+                    audioSampleNumber += sampleCount;
+                    ulong pts = checked(audioStartPts + UnitsToNanoseconds(firstSample, 8000));
+                    ulong end = checked(audioStartPts + UnitsToNanoseconds(audioSampleNumber, 8000));
+                    packet = new BridgePacket(PacketAudio, 0, pts, end - pts, frame.Payload);
+                }
+                return queue.TryAdd(packet);
+            }
+
+            private ulong TimestampToNanoseconds(ulong timestamp)
+            {
+                if (timestamp == 0 || mediaOriginTimestamp == 0 ||
+                    timestamp < mediaOriginTimestamp)
+                    return 0;
+                return checked((timestamp - mediaOriginTimestamp) * 1_000_000UL);
+            }
+
+            private bool IsAlive() =>
+                Volatile.Read(ref disposed) == 0 &&
+                Volatile.Read(ref writerFailed) == 0 &&
+                !process.HasExited;
+
+            private void PumpInput()
+            {
+                try
+                {
+                    foreach (BridgePacket packet in queue.GetConsumingEnumerable())
+                        WritePacket(packet);
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.Exchange(ref writerFailed, 1);
+                    if (Volatile.Read(ref disposed) == 0)
+                        Console.Error.WriteLine($"[PUBLISH] GStreamer input stopped: {ex.Message}");
+                }
+            }
+
+            private void WritePacket(BridgePacket packet)
+            {
+                Span<byte> header = stackalloc byte[BridgeHeaderSize];
+                header[0] = (byte)'V';
+                header[1] = (byte)'3';
+                header[2] = (byte)'8';
+                header[3] = (byte)'B';
+                header[4] = (byte)packet.Type;
+                header[5] = (byte)packet.Flags;
+                BinaryPrimitives.WriteUInt64LittleEndian(header.Slice(8, 8), packet.Pts);
+                BinaryPrimitives.WriteUInt64LittleEndian(header.Slice(16, 8), packet.Duration);
+                BinaryPrimitives.WriteUInt32LittleEndian(
+                    header.Slice(24, 4),
+                    checked((uint)packet.Payload.Length));
+                input.Write(header);
+                input.Write(packet.Payload, 0, packet.Payload.Length);
+                input.Flush();
+            }
+
+            private static ulong UnitsToNanoseconds(long units, int unitsPerSecond)
+            {
+                long seconds = units / unitsPerSecond;
+                long remainder = units % unitsPerSecond;
+                return checked((ulong)(seconds * NanosecondsPerSecond +
+                    remainder * NanosecondsPerSecond / unitsPerSecond));
             }
 
             public void Dispose()
             {
                 if (Interlocked.Exchange(ref disposed, 1) != 0) return;
 
-                videoQueue.CompleteAdding();
-                audioQueue.CompleteAdding();
-                try { videoClient?.Close(); } catch { }
-                try { audioClient?.Close(); } catch { }
-                try { videoListener.Stop(); } catch { }
-                try { audioListener.Stop(); } catch { }
+                queue.CompleteAdding();
+                try { input?.Close(); } catch { }
                 StopProcess(process);
-                videoQueue.Dispose();
-                audioQueue.Dispose();
+                queue.Dispose();
             }
 
             private static void AddArguments(ProcessStartInfo startInfo, params string[] arguments)
@@ -576,6 +722,13 @@ namespace V380Decoder.src
                 foreach (string argument in arguments)
                     startInfo.ArgumentList.Add(argument);
             }
+
+            private sealed record BridgePacket(
+                int Type,
+                int Flags,
+                ulong Pts,
+                ulong Duration,
+                byte[] Payload);
         }
     }
 }

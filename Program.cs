@@ -31,6 +31,7 @@ if (args.Length > 0)
     bool enableMjpeg = ArgParser.GetArg(args, "--enable-mjpeg", false);
     int rtspPort = ArgParser.GetArg(args, "--rtsp-port", 8554);
     int httpPort = ArgParser.GetArg(args, "--http-port", 8080);
+    string audioDumpPath = ArgParser.GetArg(args, "--audio-dump", "");
     bool secure = ArgParser.GetArg(args, "--secure", false);
     bool debug = ArgParser.GetArg(args, "--debug", false);
 
@@ -106,13 +107,14 @@ if (args.Length > 0)
             rtspPort,
             secure,
             username,
-            password);
+            password,
+            audioDumpPath);
         mediaBridge.Start();
         mediaSink = mediaBridge.CreateSink("live");
 
         if (enableOnvif)
         {
-            lowMediaSink = mediaBridge.CreateSink("live-low");
+            lowMediaSink = mediaBridge.CreateSink("live-low", includeAudio: false);
             lowStreamClient = new V380Client(
                 sourceStream == SourceStream.Cloud ? relayIp : ip,
                 port,
@@ -124,7 +126,8 @@ if (args.Length > 0)
                 enableMjpeg: false,
                 streamQuality: 0,
                 streamPath: "live-low",
-                enableSnapshots: false);
+                enableSnapshots: false,
+                includeAudio: false);
 
             lowStreamClient.StreamNegotiated = profile =>
             {
@@ -253,11 +256,14 @@ CONNECTION OPTIONS:
 OUTPUT OPTIONS:
   --output <type>        Output type: 'video', 'audio', or 'rtsp' (default: rtsp)
                          video - Raw H.264 video to stdout (pipe to ffplay)
-                         audio - Raw G.711 audio to stdout (pipe to ffplay)
-                         rtsp  - FFmpeg + MediaMTX RTSP stream (default)
+                         audio - Raw V380 IMA WAV blocks to stdout
+                         rtsp  - GStreamer + MediaMTX RTSP stream (default)
 
   --rtsp-port <number>   RTSP server port when output=rtsp (default: 8554)
                          Example: --rtsp-port 8554
+
+  --audio-dump <path>    Save raw RTSP-mode IMA WAV blocks for offline
+                         reproduction without reconnecting to the camera
 
 SERVER OPTIONS:
   --enable-api           Enable web API server (default: false)
@@ -288,8 +294,8 @@ EXAMPLES:
   2. Video to stdout (pipe to ffplay):
      V380Decoder --id 12345678 --username admin --password secret --ip 192.168.1.100 --output video | ffplay -f h264 -i pipe:0
      
-  3. Audio to stdout:
-     V380Decoder --id 12345678 --username admin --password secret --ip 192.168.1.100 --output audio | ffplay -f alaw -ar 8000 -ac 1 -i pipe:0
+  3. Capture raw camera audio blocks for analysis:
+     V380Decoder --id 12345678 --username admin --password secret --ip 192.168.1.100 --output audio > audio.ima-blocks
      
   4. Cloud streaming with web API:
      V380Decoder --id 12345678 --username admin --password secret --source cloud --enable-api

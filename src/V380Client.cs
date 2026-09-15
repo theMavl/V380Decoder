@@ -18,6 +18,7 @@ namespace V380Decoder.src
         private readonly bool enableMjpeg;
         private readonly int streamQuality;
         private readonly string streamPath;
+        private readonly bool includeAudio;
         private uint authTicket, sessionId;
         private ushort deviceVersion;
         private ushort negotiatedFrameRate;
@@ -43,7 +44,8 @@ namespace V380Decoder.src
             bool enableMjpeg,
             int streamQuality = 1,
             string streamPath = "live",
-            bool enableSnapshots = true)
+            bool enableSnapshots = true,
+            bool includeAudio = true)
         {
             this.ip = ip;
             this.port = port;
@@ -55,6 +57,7 @@ namespace V380Decoder.src
             this.enableMjpeg = enableMjpeg;
             this.streamQuality = streamQuality;
             this.streamPath = streamPath;
+            this.includeAudio = includeAudio;
             if (enableSnapshots)
             {
                 snapshotManager = new SnapshotManager();
@@ -255,7 +258,7 @@ namespace V380Decoder.src
                 WriteUInt32LE(cmd301, 8, 0); //unknown1 
                 WriteUInt16LE(cmd301, 12, 20); // requested FPS; camera returns the negotiated value
                 WriteUInt32LE(cmd301, 14, authTicket); //auth ticket
-                WriteUInt32LE(cmd301, 22, 4097); //audio 4096=off, 4097=on
+                WriteUInt32LE(cmd301, 22, includeAudio ? 4097u : 4096u);
                 WriteUInt32LE(cmd301, 26, (uint)streamQuality); // protocol selector: 0=low, 1=high
             }
             else
@@ -334,7 +337,8 @@ namespace V380Decoder.src
                     Width = frameWidth,
                     Height = frameheight,
                     FrameRate = negotiatedFrameRate,
-                    Encoding = detectedVideoEncoding
+                    Encoding = detectedVideoEncoding,
+                    HasAudio = includeAudio
                 };
 
                 if (!profile.HasSaneVideoParameters)
@@ -365,7 +369,8 @@ namespace V380Decoder.src
             if (deviceVersion > 30) GenerateMediaKey(authTicket);
             Console.Error.WriteLine(
                 $"[STREAM:{streamPath}] login OK quality={streamQuality} " +
-                $"video={frameWidth}x{frameheight}@{negotiatedFrameRate}");
+                $"video={frameWidth}x{frameheight}@{negotiatedFrameRate} " +
+                $"audio={(includeAudio ? "on" : "off")}");
             return true;
         }
 
@@ -386,7 +391,9 @@ namespace V380Decoder.src
             var audioFrags = new List<byte>();
             ushort videoTotal = 0, audioTotal = 0;
             ushort nextOldAudioFragment = 0;
+            int oldAudioBlockSize = 0;
             bool collectingOldAudio = false;
+            bool oldAudioFormatLogged = false;
 
             var header12 = new byte[12];
             var payloadBuf = new byte[65536];
@@ -395,31 +402,6 @@ namespace V380Decoder.src
             Stream stdout = (mode == OutputMode.Video || mode == OutputMode.Audio)
                 ? Console.OpenStandardOutput()
                 : null;
-
-            OldImaAudioDecoder oldAudioDecoder = null;
-
-            void EmitOldAudio(byte[] payload)
-            {
-                if (mode == OutputMode.Audio)
-                {
-                    stdout.Write(payload, 0, payload.Length);
-                    stdout.Flush();
-                }
-                else if (mode == OutputMode.Rtsp)
-                {
-                    mediaSink?.PushAudio(new FrameData
-                    {
-                        RawType = 0x1A,
-                        Payload = payload
-                    });
-                }
-            }
-
-            void ResetOldAudioDecoder()
-            {
-                oldAudioDecoder?.Dispose();
-                oldAudioDecoder = null;
-            }
 
             Console.Error.WriteLine($"[RECV] mode={mode} decrypt={needDecrypt} fps={negotiatedFrameRate}");
 
@@ -430,11 +412,11 @@ namespace V380Decoder.src
                     if (needReconnect)
                     {
                         Console.Error.WriteLine($"[STREAM] lost, reconnecting... ");
-                        ResetOldAudioDecoder();
                         mediaSink?.Reset();
                         audioFrags.Clear();
                         collectingOldAudio = false;
                         nextOldAudioFragment = 0;
+                        oldAudioBlockSize = 0;
                         try { streamStream?.Close(); streamClient?.Close(); } catch { }
                         if (!StreamLogin()) break;
                         if (!StartStream()) break;
@@ -559,7 +541,8 @@ namespace V380Decoder.src
                                 Width = frameWidth,
                                 Height = frameheight,
                                 FrameRate = negotiatedFrameRate,
-                                Encoding = detectedVideoEncoding
+                                Encoding = detectedVideoEncoding,
+                                HasAudio = includeAudio
                             });
                         }
 
@@ -577,6 +560,8 @@ namespace V380Decoder.src
                     // AUDIO old V380 protocol: IMA ADPCM 8 kHz
                     else if (type == 0x16)
                     {
+                        if (!includeAudio)
+                            continue;
                         if (curFrame == 0)
                         {
                             audioFrags.Clear();
@@ -590,11 +575,10 @@ namespace V380Decoder.src
                             curFrame != nextOldAudioFragment)
                         {
                             Console.Error.WriteLine(
-                                $"[AUDIO-OLD] fragment discontinuity total={totalFrame} cur={curFrame} expected={nextOldAudioFragment}; resetting decoder");
+                                $"[AUDIO-OLD] fragment discontinuity total={totalFrame} cur={curFrame} expected={nextOldAudioFragment}; reconnecting");
                             audioFrags.Clear();
                             collectingOldAudio = false;
                             nextOldAudioFragment = 0;
-                            ResetOldAudioDecoder();
                             if (mode == OutputMode.Rtsp)
                                 mediaSink?.Reset();
                             needReconnect = true;
@@ -613,18 +597,84 @@ namespace V380Decoder.src
                         collectingOldAudio = false;
                         nextOldAudioFragment = 0;
 
-                        const int oldAudioHeaderSize = 20;
-                        if (full.Length <= oldAudioHeaderSize)
+                        const int v380AudioHeaderSize = 16;
+                        const int imaBlockHeaderSize = 4;
+                        if (full.Length <= v380AudioHeaderSize + imaBlockHeaderSize)
                             continue;
 
-                        oldAudioDecoder ??= new OldImaAudioDecoder(EmitOldAudio);
-                        if (!oldAudioDecoder.WriteFrame(full, oldAudioHeaderSize))
-                            throw new IOException("FFmpeg ADPCM decoder stopped");
+                        uint frameId = ReadUInt32LE(full, 0);
+                        ushort frameType = ReadUInt16LE(full, 4);
+                        ushort frameRate = ReadUInt16LE(full, 6);
+                        ulong timestamp = ReadUInt64LE(full, 8);
+
+                        int blockSize = full.Length - v380AudioHeaderSize;
+                        byte stepIndex = full[v380AudioHeaderSize + 2];
+                        byte reserved = full[v380AudioHeaderSize + 3];
+                        if (stepIndex > 88 || reserved != 0)
+                        {
+                            Console.Error.WriteLine(
+                                $"[AUDIO-OLD] invalid IMA WAV block header " +
+                                $"stepIndex={stepIndex} reserved={reserved}; reconnecting");
+                            if (mode == OutputMode.Rtsp)
+                                mediaSink?.Reset();
+                            needReconnect = true;
+                            continue;
+                        }
+                        if (oldAudioBlockSize == 0)
+                            oldAudioBlockSize = blockSize;
+                        else if (blockSize != oldAudioBlockSize)
+                        {
+                            Console.Error.WriteLine(
+                                $"[AUDIO-OLD] IMA WAV block size changed " +
+                                $"from {oldAudioBlockSize} to {blockSize}; reconnecting");
+                            if (mode == OutputMode.Rtsp)
+                                mediaSink?.Reset();
+                            needReconnect = true;
+                            continue;
+                        }
+
+                        byte[] payload = new byte[blockSize];
+                        Array.Copy(
+                            full,
+                            v380AudioHeaderSize,
+                            payload,
+                            0,
+                            payload.Length);
+
+                        if (!oldAudioFormatLogged)
+                        {
+                            Console.Error.WriteLine(
+                                $"[AUDIO-OLD:{streamPath}] frame={full.Length} " +
+                                $"v380Header={v380AudioHeaderSize} " +
+                                $"imaWavBlock={blockSize} " +
+                                $"samples={1 + (blockSize - imaBlockHeaderSize) * 2}");
+                            oldAudioFormatLogged = true;
+                        }
+
+                        if (mode == OutputMode.Audio)
+                        {
+                            stdout.Write(payload, 0, payload.Length);
+                            stdout.Flush();
+                        }
+                        else if (mode == OutputMode.Rtsp)
+                        {
+                            mediaSink?.PushAudio(new FrameData
+                            {
+                                RawType = type,
+                                FrameId = frameId,
+                                FrameType = frameType,
+                                FrameRate = frameRate,
+                                Timestamp = timestamp,
+                                Payload = payload
+                            });
+                        }
                     }
 
                     // AUDIO  0x1A
                     else if (type == 0x1A)
                     {
+                        if (!includeAudio)
+                            continue;
                         if (curFrame == 0) { audioFrags.Clear(); audioTotal = totalFrame; }
                         if (totalFrame != audioTotal) { audioFrags.Clear(); audioTotal = totalFrame; }
 
@@ -693,7 +743,6 @@ namespace V380Decoder.src
             }
             finally
             {
-                ResetOldAudioDecoder();
                 if (!ct.IsCancellationRequested)
                     mediaSink?.Reset();
             }

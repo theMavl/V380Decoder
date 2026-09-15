@@ -4,7 +4,7 @@ Extract video and audio from encrypted V380 camera. Newer V380 cameras use encry
 
 This is a port of [prsyahmi/v380](https://github.com/prsyahmi/v380) with significant enhancements:
 - ✅ Audio and video decryption
-- ✅ RTSP output through FFmpeg and MediaMTX
+- ✅ RTSP output through GStreamer and MediaMTX
 - ✅ ONVIF support
 - ✅ Web UI and REST API for camera control
 - ✅ Snapshot API
@@ -25,7 +25,8 @@ This is a port of [prsyahmi/v380](https://github.com/prsyahmi/v380) with signifi
 ## Requirements
 
 - .NET 10 SDK (for building from source)
-- FFmpeg (required for RTSP, snapshots and audio decoding)
+- FFmpeg (required for snapshots)
+- GStreamer with base, good, bad and RTSP plugins (required for RTSP publishing)
 - MediaMTX (required for RTSP; included in the Docker image)
 
 ## Command Line Arguments
@@ -43,6 +44,7 @@ This is a port of [prsyahmi/v380](https://github.com/prsyahmi/v380) with signifi
 | `--enable-api` | `false` | No | Enable Web UI and REST API |
 | `--enable-mjpeg` | `false` | No | Enable Mjpeg stream |
 | `--rtsp-port` | `8554` | No | RTSP server port |
+| `--audio-dump` | - | No | Save raw RTSP-mode IMA WAV blocks for offline reproduction |
 | `--http-port` | `8080` | No | Web server port (for ONVIF/API) |
 | `--secure` | `false` | No | Enable authentication for ONVIF, RTSP and API. Uses the same username and password as the V380 camera |
 | `--debug` | `false` | No | Enable debug logging |
@@ -64,20 +66,29 @@ Download Latest [Release](https://github.com/PyanSofyan/V380decoder/releases/lat
 
 ### Audio Output (pipe to FFplay)
 ```bash
-./V380Decoder --id 12345678 --username admin --password password --ip 192.168.1.2 --output audio | ffplay -f alaw -ar 8000 -ac 1 -i pipe:0
+./V380Decoder --id 12345678 --username admin --password password --ip 192.168.1.2 --output audio > audio.ima-blocks
 ```
 
 ### RTSP Server
 
-In RTSP mode the application sends the camera's elementary video and audio
-streams through FFmpeg and publishes them to the bundled MediaMTX server.
-The legacy in-process RTP/RTCP implementation is not used.
+Raw captures show that every legacy V380 `0x16` audio frame contains a 16-byte
+V380 header followed by a complete Microsoft IMA WAV block. The block's
+predictor, step index, and reserved byte are preserved, allowing GStreamer's
+`adpcmdec` to reset codec state at every camera frame before conversion to
+G.711. There is no custom audio decoder or intermediate FFmpeg process. G.711
+audio and camera video receive explicit media
+timestamps and are published by GStreamer to the bundled MediaMTX server.
+Arrival remains paced by the camera; the publisher does not hold packets against
+its local wall clock. FFmpeg is not used as the RTSP publisher or muxer.
 
 When ONVIF is enabled, the application also probes the V380 low-quality
 selector after the primary stream is negotiated. ONVIF advertises the
 additional profile only when the camera accepts it and returns a distinct
 resolution/frame-rate combination. Profile dimensions and frame rate come
-from the camera's stream-login response; they are not configured locally.
+from the camera's stream-login response; they are not configured locally. The
+primary `/live` session is the only session that requests camera audio;
+`/live-low` is video-only so two concurrent V380 sessions do not contend for
+the same microphone stream.
 
 ```bash
 # Default (RTSP mode)
@@ -257,7 +268,7 @@ sudo systemctl status v380decoder
 
 Build and run:
 ```bash
-docker build -t v380decoder .
+sudo docker build --no-cache -t v380decoder .
 docker run -d --restart unless-stopped --network host v380decoder --id 12345678 --username admin --password password --ip 192.168.1.2 --enable-onvif --enable-api
 ```
 

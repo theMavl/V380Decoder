@@ -373,10 +373,16 @@ namespace V380Decoder.src
                     }
 
                     // 12-byte fragment header
-                    if (ReadExact(streamStream, header12, 0, 12) < 12) continue;
+                    if (ReadExact(streamStream, header12, 0, 12) < 12)
+                    {
+                        needReconnect = true;
+                        continue;
+                    }
 
                     if (header12[0] != 0x7F)
                     {
+                        Console.Error.WriteLine($"[STREAM] invalid fragment magic 0x{header12[0]:X2}; reconnecting");
+                        needReconnect = true;
                         continue;
                     }
 
@@ -387,12 +393,17 @@ namespace V380Decoder.src
 
                     if (payLen == 0 || payLen > 20000 || totalFrame == 0 || curFrame >= totalFrame)
                     {
-                        Console.Error.WriteLine($"[SKIP] invalid header type=0x{type:X2} total={totalFrame} cur={curFrame} len={payLen}");
+                        Console.Error.WriteLine($"[STREAM] invalid header type=0x{type:X2} total={totalFrame} cur={curFrame} len={payLen}; reconnecting");
+                        needReconnect = true;
                         continue;
                     }
 
                     if (payloadBuf.Length < payLen) payloadBuf = new byte[payLen];
-                    if (ReadExact(streamStream, payloadBuf, 0, payLen) < payLen) continue;
+                    if (ReadExact(streamStream, payloadBuf, 0, payLen) < payLen)
+                    {
+                        needReconnect = true;
+                        continue;
+                    }
 
                     // VIDEO  0x00=I-frame  0x01=P-frame  0x28/0x29=alt-video (fw v32+)
                     if (type == 0x00 || type == 0x01 || type == 0x28 || type == 0x29)
@@ -723,7 +734,11 @@ namespace V380Decoder.src
                     continue;
                 }
                 int n = s.Read(buf, off + tot, cnt - tot);
-                if (n <= 0) break;
+                if (n <= 0)
+                {
+                    needReconnect = true;
+                    break;
+                }
                 tot += n;
             }
             return tot;

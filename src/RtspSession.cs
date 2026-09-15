@@ -28,10 +28,22 @@ namespace V380Decoder.src
         private readonly uint audioSsrc = (uint)Random.Shared.NextInt64(1, 1L << 32);
         private readonly byte[] rtcpCname;
 
-        // Monotonically increasing synthetic RTP timestamps
-        private uint _videoRtsClock = (uint)Random.Shared.NextInt64(0, 1L << 32);
-        private const uint RTP_VIDEO_TICK = 7500;  // ~12 fps at 90 kHz clock
-        private uint _audioRtsClock = (uint)Random.Shared.NextInt64(0, 1L << 32);
+        // Both tracks are tied to the same monotonic clock.  The previous
+        // implementation advanced video by a fixed 7500 ticks per frame,
+        // effectively claiming that every camera ran at exactly 12 fps.
+        // That made A/V drift indefinitely whenever the real rate differed.
+        private readonly long mediaClockOriginTicks = Stopwatch.GetTimestamp();
+        private readonly uint videoRtpBase = (uint)Random.Shared.NextInt64(0, 1L << 32);
+        private readonly uint audioRtpBase = (uint)Random.Shared.NextInt64(0, 1L << 32);
+        private uint lastVideoRtpTimestamp;
+        private bool videoClockInitialized;
+        private uint nextAudioRtpTimestamp;
+        private bool audioClockInitialized;
+
+        // A small amount of scheduler jitter is normal.  A larger difference
+        // means that the upstream camera/decoder stopped or restarted, so the
+        // audio clock must follow real time instead of accumulating latency.
+        private const int MaxAudioClockDriftSamples = 1600; // 200 ms at 8 kHz
 
         private long audioPacketCount;
         private long videoPacketCount;
@@ -332,17 +344,14 @@ namespace V380Decoder.src
         {
             if (!playing) return;
 
-            // Use synthetic monotonically increasing RTP timestamps
-            // Camera timestamps are unreliable and cause non-monotonic DTS errors
-            _videoRtsClock = unchecked(_videoRtsClock + RTP_VIDEO_TICK);
+            uint rts = GetMonotonicVideoTimestamp();
 
             if (server.IsH265)
             {
-                PushVideoH265(f.Payload, _videoRtsClock);
+                PushVideoH265(f.Payload, rts);
                 return;
             }
 
-            uint rts = _videoRtsClock;
             RtspServer.ParseNals(f.Payload, (nalType, nal) =>
             {
                 const int MTU = 1400;
@@ -442,16 +451,60 @@ namespace V380Decoder.src
         {
             if (!playing || f.Payload == null || f.Payload.Length == 0) return;
 
-            // PCMA has one sample per byte. Preserve the camera frame boundary
-            // and advance the 8 kHz RTP clock by the exact sample count.
+            // PCMA has one sample per byte.  Normally timestamps advance by the
+            // exact sample count.  After an upstream pause/reconnect, jump to
+            // the shared wall-clock timeline so stale audio cannot accumulate.
+            uint wallClockTimestamp = GetRtpTimestampNow(audioRtpBase, 8000);
+            if (!audioClockInitialized)
+            {
+                nextAudioRtpTimestamp = wallClockTimestamp;
+                audioClockInitialized = true;
+            }
+            else
+            {
+                int drift = unchecked((int)(wallClockTimestamp - nextAudioRtpTimestamp));
+                if (drift > MaxAudioClockDriftSamples || drift < -MaxAudioClockDriftSamples)
+                {
+                    LogUtils.debug($"[RTSP#{id}] AUDIO clock resync driftSamples={drift}");
+                    nextAudioRtpTimestamp = wallClockTimestamp;
+                }
+            }
+
             ushort seq = audioSeq;
-            uint timestamp = _audioRtsClock;
+            uint timestamp = nextAudioRtpTimestamp;
             if (SendRtp(audioCh, 8, seq, timestamp, audioSsrc,
                         f.Payload, 0, f.Payload.Length, marker: false))
             {
                 audioSeq = unchecked((ushort)(audioSeq + 1));
-                _audioRtsClock = unchecked(_audioRtsClock + (uint)f.Payload.Length);
+                nextAudioRtpTimestamp = unchecked(nextAudioRtpTimestamp + (uint)f.Payload.Length);
             }
+        }
+
+        private uint GetMonotonicVideoTimestamp()
+        {
+            uint timestamp = GetRtpTimestampNow(videoRtpBase, 90000);
+
+            // Two frames can occasionally be delivered in one burst.  Keep
+            // their RTP timestamps strictly increasing without inventing a
+            // fixed frame rate.
+            if (videoClockInitialized && unchecked((int)(timestamp - lastVideoRtpTimestamp)) <= 0)
+                timestamp = unchecked(lastVideoRtpTimestamp + 1);
+
+            lastVideoRtpTimestamp = timestamp;
+            videoClockInitialized = true;
+            return timestamp;
+        }
+
+        private uint GetRtpTimestampNow(uint timestampBase, uint clockRate)
+        {
+            long elapsed = Stopwatch.GetTimestamp() - mediaClockOriginTicks;
+            if (elapsed < 0) elapsed = 0;
+
+            ulong wholeSeconds = (ulong)(elapsed / Stopwatch.Frequency);
+            ulong remainder = (ulong)(elapsed % Stopwatch.Frequency);
+            ulong clockTicks = wholeSeconds * clockRate +
+                               remainder * clockRate / (ulong)Stopwatch.Frequency;
+            return unchecked(timestampBase + (uint)clockTicks);
         }
 
         // ── Low-level RTP sender with RTSP interleaved framing ───

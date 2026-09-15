@@ -9,13 +9,18 @@ namespace V380Decoder.src
     internal sealed class OldImaAudioDecoder : IDisposable
     {
         private const int RtpPacketSamples = 160;
+        private const int MaxQueuedSamples = 8000;    // one second
+        private const int ResumeQueuedSamples = 4000; // half a second
 
         private readonly Action<byte[]> onDecodedPcma;
         private readonly Process process;
         private readonly Stream input;
         private readonly object inputLock = new();
+        private readonly ManualResetEventSlim stopSignal = new(false);
         private readonly Thread outputThread;
         private readonly Thread errorThread;
+        private long inputSampleCount;
+        private long outputSampleCount;
         private int disposed;
 
         public OldImaAudioDecoder(Action<byte[]> onDecodedPcma)
@@ -74,7 +79,20 @@ namespace V380Decoder.src
                     if (disposed != 0 || process.HasExited)
                         return false;
 
-                    input.Write(frame, headerSize, frame.Length - headerSize);
+                    int encodedLength = frame.Length - headerSize;
+                    // adpcm_ima_ws expands every byte into two PCM samples.
+                    // Count before Write so the output thread cannot observe
+                    // decoded data before its input has been accounted for.
+                    Interlocked.Add(ref inputSampleCount, encodedLength * 2L);
+                    try
+                    {
+                        input.Write(frame, headerSize, encodedLength);
+                    }
+                    catch
+                    {
+                        Interlocked.Add(ref inputSampleCount, -encodedLength * 2L);
+                        throw;
+                    }
                     input.Flush();
                 }
                 return true;
@@ -91,6 +109,8 @@ namespace V380Decoder.src
         {
             var packet = new byte[RtpPacketSamples];
             int packetLength = 0;
+            long nextPacketDueTicks = 0;
+            bool droppingBacklog = false;
 
             try
             {
@@ -103,7 +123,34 @@ namespace V380Decoder.src
                     packetLength += read;
                     if (packetLength != packet.Length) continue;
 
-                    onDecodedPcma((byte[])packet.Clone());
+                    long samplesRead = Interlocked.Add(ref outputSampleCount, packet.Length);
+                    long queuedSamples = Volatile.Read(ref inputSampleCount) - samplesRead;
+
+                    // If the camera clock is slightly faster than the nominal
+                    // 8 kHz rate, an unlimited pipe queue turns that difference
+                    // into ever-growing A/V delay.  Drop only stale, already
+                    // decoded audio and keep at most a small bounded cushion.
+                    if (!droppingBacklog && queuedSamples > MaxQueuedSamples)
+                    {
+                        droppingBacklog = true;
+                        Console.Error.WriteLine(
+                            $"[AUDIO-OLD] dropping stale audio backlog queuedSamples={queuedSamples}");
+                    }
+
+                    if (droppingBacklog)
+                    {
+                        packetLength = 0;
+                        nextPacketDueTicks = 0;
+                        if (queuedSamples <= ResumeQueuedSamples)
+                            droppingBacklog = false;
+                        continue;
+                    }
+
+                    if (!WaitForPacketTime(ref nextPacketDueTicks))
+                        break;
+
+                    if (Volatile.Read(ref disposed) == 0)
+                        onDecodedPcma((byte[])packet.Clone());
                     packetLength = 0;
                 }
             }
@@ -112,6 +159,27 @@ namespace V380Decoder.src
                 if (Volatile.Read(ref disposed) == 0)
                     Console.Error.WriteLine($"[AUDIO-OLD] FFmpeg output error: {ex.Message}");
             }
+        }
+
+        private bool WaitForPacketTime(ref long nextPacketDueTicks)
+        {
+            long now = Stopwatch.GetTimestamp();
+            long packetTicks = Stopwatch.Frequency * RtpPacketSamples / 8000;
+            long maxLatenessTicks = Stopwatch.Frequency / 4;
+
+            if (nextPacketDueTicks == 0 || now - nextPacketDueTicks > maxLatenessTicks)
+                nextPacketDueTicks = now;
+
+            while (nextPacketDueTicks > now)
+            {
+                double seconds = (double)(nextPacketDueTicks - now) / Stopwatch.Frequency;
+                if (stopSignal.Wait(TimeSpan.FromSeconds(seconds)))
+                    return false;
+                now = Stopwatch.GetTimestamp();
+            }
+
+            nextPacketDueTicks += packetTicks;
+            return Volatile.Read(ref disposed) == 0;
         }
 
         private void PumpErrors()
@@ -132,6 +200,7 @@ namespace V380Decoder.src
         public void Dispose()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            stopSignal.Set();
 
             lock (inputLock)
             {

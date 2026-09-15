@@ -16,16 +16,34 @@ namespace V380Decoder.src
         private readonly SourceStream source;
         private readonly OutputMode mode;
         private readonly bool enableMjpeg;
+        private readonly int streamQuality;
+        private readonly string streamPath;
         private uint authTicket, sessionId;
-        private ushort deviceVersion, communicationVersion;
-        private int frameWidth = 1280;
-        private int frameheight = 720;
+        private ushort deviceVersion;
+        private ushort negotiatedFrameRate;
+        private int frameWidth;
+        private int frameheight;
         private byte[] aesKey = new byte[16];
         private bool needReconnect = false;
+        private bool streamProfileRejected = false;
+        private string detectedVideoEncoding = string.Empty;
         private DeviceInfo deviceInfo;
 
+        public Func<V380StreamProfile, bool> StreamNegotiated { get; set; }
+        public Action StreamUnavailable { get; set; }
 
-        public V380Client(string ip, int port, uint deviceId, string username, string password, SourceStream source, OutputMode mode, bool enableMjpeg)
+        public V380Client(
+            string ip,
+            int port,
+            uint deviceId,
+            string username,
+            string password,
+            SourceStream source,
+            OutputMode mode,
+            bool enableMjpeg,
+            int streamQuality = 1,
+            string streamPath = "live",
+            bool enableSnapshots = true)
         {
             this.ip = ip;
             this.port = port;
@@ -35,8 +53,13 @@ namespace V380Decoder.src
             this.source = source;
             this.mode = mode;
             this.enableMjpeg = enableMjpeg;
-            snapshotManager = new SnapshotManager();
-            snapshotManager.SetMjpegActive(enableMjpeg);
+            this.streamQuality = streamQuality;
+            this.streamPath = streamPath;
+            if (enableSnapshots)
+            {
+                snapshotManager = new SnapshotManager();
+                snapshotManager.SetMjpegActive(enableMjpeg);
+            }
         }
 
         public void Run(IMediaSink mediaSink, CancellationToken ct)
@@ -52,6 +75,7 @@ namespace V380Decoder.src
 
                     if (!StreamLogin())
                     {
+                        if (streamProfileRejected) break;
                         Console.Error.WriteLine("[STREAM] Retrying...");
                         streamStream?.Close(); streamClient?.Close();
                         continue;
@@ -168,6 +192,7 @@ namespace V380Decoder.src
                 byte[] domainBytes = new byte[32];
                 Array.Copy(resp, 26, domainBytes, 0, 32);
                 string domain = Encoding.ASCII.GetString(domainBytes).TrimEnd('\0');
+                byte channelCount = resp.Length > 63 ? resp[63] : (byte)0;
 
                 LogUtils.debug($"[AUTH] response success");
                 LogUtils.debug($"[AUTH] cmd: {respCmd}");
@@ -181,6 +206,8 @@ namespace V380Decoder.src
                 LogUtils.debug($"[AUTH] vendorId: {vendorId}");
                 LogUtils.debug($"[AUTH] isDomainExists: {isDomainExists}");
                 LogUtils.debug($"[AUTH] domain: {domain}");
+                if (channelCount > 0 && channelCount < 32)
+                    LogUtils.debug($"[AUTH] channels: {channelCount}");
 
                 deviceVersion = version;
                 sessionId = session;
@@ -226,10 +253,10 @@ namespace V380Decoder.src
             {
                 WriteUInt32LE(cmd301, 4, deviceId); //device id
                 WriteUInt32LE(cmd301, 8, 0); //unknown1 
-                WriteUInt16LE(cmd301, 12, 20); //unknown2 
+                WriteUInt16LE(cmd301, 12, 20); // requested FPS; camera returns the negotiated value
                 WriteUInt32LE(cmd301, 14, authTicket); //auth ticket
                 WriteUInt32LE(cmd301, 22, 4097); //audio 4096=off, 4097=on
-                WriteUInt32LE(cmd301, 26, 1);    //quality  0=SD, 1=HD
+                WriteUInt32LE(cmd301, 26, (uint)streamQuality); // protocol selector: 0=low, 1=high
             }
             else
             {
@@ -240,7 +267,7 @@ namespace V380Decoder.src
                 WriteUInt32LE(cmd301, 62, deviceId); //device id
                 WriteUInt32LE(cmd301, 66, authTicket); // auth ticket
                 WriteUInt32LE(cmd301, 70, sessionId); // session id
-                WriteUInt32LE(cmd301, 74, 1); //quality 0=SD, 1=HD
+                WriteUInt32LE(cmd301, 74, (uint)streamQuality); // protocol selector: 0=low, 1=high
                 cmd301[78] = 20; //unknown2 
                 WriteUInt32LE(cmd301, 79, 1); //unknown23
             }
@@ -266,38 +293,79 @@ namespace V380Decoder.src
             }
 
             int result = (int)ReadUInt32LE(resp401, 4);
-            if (result == -11 || result == -12)
+            if (result != 402 && result != 1001)
             {
                 Console.Error.WriteLine($"[STREAM] login failed result={result}");
+                if (result == -11 || result == -12)
+                {
+                    streamProfileRejected = true;
+                    StreamUnavailable?.Invoke();
+                }
                 return false;
             }
 
             LogUtils.debug($"[STREAM] login response success");
             LogUtils.debug($"[STREAM] login cmd: {respCmd}");
-            if (source == SourceStream.Lan)
+            if (resp401.Length >= 18)
             {
-                ushort version = ReadUInt16LE(resp401, 8);
+                ushort fps = ReadUInt16LE(resp401, 8);
                 uint width = ReadUInt32LE(resp401, 10);
                 uint height = ReadUInt32LE(resp401, 14);
-                uint maxPackSize = ReadUInt32LE(resp401, 18);
-                byte audioFreq = resp401[22];
-                byte audioBits = resp401[23];
-                byte audioChannels = resp401[24];
-                communicationVersion = version;
+                uint maxPackSize = resp401.Length >= 22 ? ReadUInt32LE(resp401, 18) : 0;
+                byte audioFreq = resp401.Length > 22 ? resp401[22] : (byte)0;
+                byte audioBits = resp401.Length > 23 ? resp401[23] : (byte)0;
+                byte audioChannels = resp401.Length > 24 ? resp401[24] : (byte)0;
+                negotiatedFrameRate = fps;
                 frameWidth = (int)width;
                 frameheight = (int)height;
                 LogUtils.debug($"[STREAM] login result: {result}");
-                LogUtils.debug($"[STREAM] login version: {version}");
+                LogUtils.debug($"[STREAM] login fps: {fps}");
                 LogUtils.debug($"[STREAM] login width: {width}");
                 LogUtils.debug($"[STREAM] login height: {height}");
                 LogUtils.debug($"[STREAM] login maxPackSize: {maxPackSize}");
                 LogUtils.debug($"[STREAM] login audioFreq: {audioFreq}");
                 LogUtils.debug($"[STREAM] login audioBits: {audioBits}");
                 LogUtils.debug($"[STREAM] login audioChannels: {audioChannels}");
+
+                var profile = new V380StreamProfile
+                {
+                    Quality = streamQuality,
+                    Path = streamPath,
+                    Width = frameWidth,
+                    Height = frameheight,
+                    FrameRate = negotiatedFrameRate,
+                    Encoding = detectedVideoEncoding
+                };
+
+                if (!profile.HasSaneVideoParameters)
+                {
+                    Console.Error.WriteLine(
+                        $"[STREAM:{streamPath}] camera returned invalid video parameters " +
+                        $"{frameWidth}x{frameheight}@{negotiatedFrameRate}");
+                    streamProfileRejected = true;
+                    StreamUnavailable?.Invoke();
+                    return false;
+                }
+
+                if (StreamNegotiated != null && !StreamNegotiated(profile))
+                {
+                    streamProfileRejected = true;
+                    Console.Error.WriteLine(
+                        $"[STREAM:{streamPath}] {frameWidth}x{frameheight}@{negotiatedFrameRate} " +
+                        "duplicates another negotiated stream; skipping");
+                    return false;
+                }
+            }
+            else
+            {
+                Console.Error.WriteLine("[STREAM] login response does not contain video parameters");
+                return false;
             }
 
             if (deviceVersion > 30) GenerateMediaKey(authTicket);
-            Console.Error.WriteLine($"[STREAM] login OK");
+            Console.Error.WriteLine(
+                $"[STREAM:{streamPath}] login OK quality={streamQuality} " +
+                $"video={frameWidth}x{frameheight}@{negotiatedFrameRate}");
             return true;
         }
 
@@ -337,6 +405,14 @@ namespace V380Decoder.src
                     stdout.Write(payload, 0, payload.Length);
                     stdout.Flush();
                 }
+                else if (mode == OutputMode.Rtsp)
+                {
+                    mediaSink?.PushAudio(new FrameData
+                    {
+                        RawType = 0x1A,
+                        Payload = payload
+                    });
+                }
             }
 
             void ResetOldAudioDecoder()
@@ -345,7 +421,7 @@ namespace V380Decoder.src
                 oldAudioDecoder = null;
             }
 
-            Console.Error.WriteLine($"[RECV] mode={mode} decrypt={needDecrypt} communicationVersion={communicationVersion}");
+            Console.Error.WriteLine($"[RECV] mode={mode} decrypt={needDecrypt} fps={negotiatedFrameRate}");
 
             try
             {
@@ -427,7 +503,7 @@ namespace V380Decoder.src
 
                         if (needDecrypt)
                         {
-                            if (communicationVersion == 21)
+                            if (negotiatedFrameRate == 21)
                                 DecryptMediaPre2k(payload, payload.Length, 1);
                             else
                                 DecryptVideoFrame(payload, payload.Length);
@@ -460,7 +536,7 @@ namespace V380Decoder.src
                             payload = trimmed;
                         }
 
-                        snapshotManager.UpdateFrame(payload, frameWidth, frameheight, isIFrame: type == 0x00);
+                        snapshotManager?.UpdateFrame(payload, frameWidth, frameheight, isIFrame: type == 0x00);
 
                         var fd = new FrameData
                         {
@@ -471,6 +547,21 @@ namespace V380Decoder.src
                             Timestamp = timestamp,
                             Payload = payload
                         };
+
+                        string encoding = type == 0x28 || type == 0x29 ? "H265" : "H264";
+                        if (!string.Equals(detectedVideoEncoding, encoding, StringComparison.Ordinal))
+                        {
+                            detectedVideoEncoding = encoding;
+                            StreamNegotiated?.Invoke(new V380StreamProfile
+                            {
+                                Quality = streamQuality,
+                                Path = streamPath,
+                                Width = frameWidth,
+                                Height = frameheight,
+                                FrameRate = negotiatedFrameRate,
+                                Encoding = detectedVideoEncoding
+                            });
+                        }
 
                         if (mode == OutputMode.Video)
                         {
@@ -526,26 +617,9 @@ namespace V380Decoder.src
                         if (full.Length <= oldAudioHeaderSize)
                             continue;
 
-                        if (mode == OutputMode.Audio)
-                        {
-                            oldAudioDecoder ??= new OldImaAudioDecoder(EmitOldAudio);
-                            if (!oldAudioDecoder.WriteFrame(full, oldAudioHeaderSize))
-                                throw new IOException("FFmpeg ADPCM decoder stopped");
-                        }
-                        else if (mode == OutputMode.Rtsp)
-                        {
-                            // Preserve the exact old implementation boundary:
-                            // strip 20 V380 bytes, then let the publisher's
-                            // FFmpeg adpcm_ima_ws decoder consume one continuous
-                            // byte stream.
-                            byte[] payload = new byte[full.Length - oldAudioHeaderSize];
-                            Array.Copy(full, oldAudioHeaderSize, payload, 0, payload.Length);
-                            mediaSink?.PushAudio(new FrameData
-                            {
-                                RawType = 0x16,
-                                Payload = payload
-                            });
-                        }
+                        oldAudioDecoder ??= new OldImaAudioDecoder(EmitOldAudio);
+                        if (!oldAudioDecoder.WriteFrame(full, oldAudioHeaderSize))
+                            throw new IOException("FFmpeg ADPCM decoder stopped");
                     }
 
                     // AUDIO  0x1A
@@ -573,7 +647,7 @@ namespace V380Decoder.src
 
                         if (needDecrypt)
                         {
-                            if (communicationVersion == 21)
+                            if (negotiatedFrameRate == 21)
                                 DecryptMediaPre2k(payload, payload.Length, 1);
                             else
                                 DecryptAudioFrame(payload, payload.Length);

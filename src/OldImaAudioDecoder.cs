@@ -21,6 +21,7 @@ namespace V380Decoder.src
         private readonly Thread errorThread;
         private long inputSampleCount;
         private long outputSampleCount;
+        private int outputFailed;
         private int disposed;
 
         public OldImaAudioDecoder(Action<byte[]> onDecodedPcma)
@@ -39,6 +40,9 @@ namespace V380Decoder.src
 
             AddArguments(startInfo,
                 "-hide_banner", "-nostats", "-loglevel", "warning",
+                // This is a raw stream with all parameters already known.
+                // Do not buffer seconds of camera audio for stream probing.
+                "-probesize", "32", "-analyzeduration", "0",
                 "-f", "s16le", "-ar", "8000", "-ac", "1",
                 "-c:a", "adpcm_ima_ws", "-i", "pipe:0",
                 "-map", "0:a:0", "-c:a", "pcm_alaw",
@@ -69,7 +73,7 @@ namespace V380Decoder.src
         {
             if (frame == null || frame.Length <= headerSize)
                 return true;
-            if (Volatile.Read(ref disposed) != 0)
+            if (Volatile.Read(ref disposed) != 0 || Volatile.Read(ref outputFailed) != 0)
                 return false;
 
             try
@@ -118,7 +122,12 @@ namespace V380Decoder.src
                 while (Volatile.Read(ref disposed) == 0)
                 {
                     int read = output.Read(packet, packetLength, packet.Length - packetLength);
-                    if (read <= 0) break;
+                    if (read <= 0)
+                    {
+                        if (Volatile.Read(ref disposed) == 0)
+                            Interlocked.Exchange(ref outputFailed, 1);
+                        break;
+                    }
 
                     packetLength += read;
                     if (packetLength != packet.Length) continue;
@@ -156,6 +165,7 @@ namespace V380Decoder.src
             }
             catch (Exception ex)
             {
+                Interlocked.Exchange(ref outputFailed, 1);
                 if (Volatile.Read(ref disposed) == 0)
                     Console.Error.WriteLine($"[AUDIO-OLD] FFmpeg output error: {ex.Message}");
             }

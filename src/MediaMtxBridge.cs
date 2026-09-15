@@ -22,15 +22,9 @@ namespace V380Decoder.src
         private readonly string username;
         private readonly string password;
         private readonly object stateLock = new();
-        private readonly List<byte[]> pendingVideo = new();
-        private readonly List<byte[]> pendingAudio = new();
+        private readonly Dictionary<string, StreamState> streams = new(StringComparer.Ordinal);
 
         private Process mediaMtxProcess;
-        private Publisher publisher;
-        private string videoInputFormat;
-        private string audioInputFormat;
-        private string audioDecoder;
-        private bool haveVideoKeyframe;
         private string configDirectory;
         private int disposed;
 
@@ -92,6 +86,29 @@ namespace V380Decoder.src
         }
 
         public void PushVideo(FrameData frame)
+            => PushVideo("live", frame);
+
+        public void PushAudio(FrameData frame)
+            => PushAudio("live", frame);
+
+        public void Reset()
+            => Reset("live");
+
+        public IMediaSink CreateSink(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path) ||
+                path.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_')))
+                throw new ArgumentException("RTSP path contains unsupported characters", nameof(path));
+
+            lock (stateLock)
+            {
+                ThrowIfDisposed();
+                GetStreamLocked(path);
+            }
+            return new PathSink(this, path);
+        }
+
+        private void PushVideo(string path, FrameData frame)
         {
             if (frame?.Payload == null || frame.Payload.Length == 0) return;
 
@@ -100,34 +117,35 @@ namespace V380Decoder.src
             {
                 ThrowIfDisposed();
                 EnsureMediaMtxAlive();
+                StreamState stream = GetStreamLocked(path);
 
-                if (publisher == null)
+                if (stream.Publisher == null)
                 {
                     bool isH265 = frame.RawType == 0x28 || frame.RawType == 0x29;
                     bool isKeyframe = frame.RawType == 0x00 || frame.RawType == 0x28;
 
-                    if (!haveVideoKeyframe)
+                    if (!stream.HaveVideoKeyframe)
                     {
                         if (!isKeyframe) return;
-                        haveVideoKeyframe = true;
-                        videoInputFormat = isH265 ? "hevc" : "h264";
+                        stream.HaveVideoKeyframe = true;
+                        stream.VideoInputFormat = isH265 ? "hevc" : "h264";
                     }
 
-                    if (pendingVideo.Count >= MaxPendingVideoFrames)
+                    if (stream.PendingVideo.Count >= MaxPendingVideoFrames)
                         throw new IOException("FFmpeg publisher did not start before the video queue filled");
-                    pendingVideo.Add(frame.Payload);
-                    TryStartPublisherLocked();
+                    stream.PendingVideo.Add(frame.Payload);
+                    TryStartPublisherLocked(path, stream);
                     return;
                 }
 
-                activePublisher = publisher;
+                activePublisher = stream.Publisher;
             }
 
             if (!activePublisher.TryPushVideo(frame.Payload))
                 throw new IOException("FFmpeg video publisher stopped or its queue filled");
         }
 
-        public void PushAudio(FrameData frame)
+        private void PushAudio(string path, FrameData frame)
         {
             if (frame?.Payload == null || frame.Payload.Length == 0) return;
 
@@ -136,85 +154,105 @@ namespace V380Decoder.src
             {
                 ThrowIfDisposed();
                 EnsureMediaMtxAlive();
+                StreamState stream = GetStreamLocked(path);
 
-                if (publisher == null)
+                if (stream.Publisher == null)
                 {
                     switch (frame.RawType)
                     {
                         case 0x16:
-                            audioInputFormat = "s16le";
-                            audioDecoder = "adpcm_ima_ws";
-                            break;
+                            throw new InvalidDataException(
+                                "Raw V380 ADPCM reached the RTSP publisher without decoding");
                         case 0x1A:
-                            audioInputFormat = "alaw";
-                            audioDecoder = null;
+                            stream.AudioInputFormat = "alaw";
                             break;
                         default:
                             throw new InvalidDataException($"Unsupported V380 audio type 0x{frame.RawType:X2}");
                     }
 
-                    if (pendingAudio.Count >= MaxPendingAudioFrames)
+                    if (stream.PendingAudio.Count >= MaxPendingAudioFrames)
                         throw new IOException("FFmpeg publisher did not start before the audio queue filled");
-                    pendingAudio.Add(frame.Payload);
-                    TryStartPublisherLocked();
+                    stream.PendingAudio.Add(frame.Payload);
+                    TryStartPublisherLocked(path, stream);
                     return;
                 }
 
-                activePublisher = publisher;
+                activePublisher = stream.Publisher;
             }
 
             if (!activePublisher.TryPushAudio(frame.Payload))
                 throw new IOException("FFmpeg audio publisher stopped or its queue filled");
         }
 
-        public void Reset()
+        private void Reset(string path)
         {
             Publisher oldPublisher;
             lock (stateLock)
             {
                 if (Volatile.Read(ref disposed) != 0) return;
+                StreamState stream = GetStreamLocked(path);
 
-                oldPublisher = publisher;
-                publisher = null;
-                videoInputFormat = null;
-                audioInputFormat = null;
-                audioDecoder = null;
-                haveVideoKeyframe = false;
-                pendingVideo.Clear();
-                pendingAudio.Clear();
+                oldPublisher = stream.Publisher;
+                stream.Publisher = null;
+                stream.VideoInputFormat = null;
+                stream.AudioInputFormat = null;
+                stream.HaveVideoKeyframe = false;
+                stream.PendingVideo.Clear();
+                stream.PendingAudio.Clear();
             }
 
             oldPublisher?.Dispose();
             if (oldPublisher != null)
-                Console.Error.WriteLine("[PUBLISH] source reset; waiting for a new keyframe");
+                Console.Error.WriteLine($"[PUBLISH:{path}] source reset; waiting for a new keyframe");
         }
 
-        private void TryStartPublisherLocked()
+        private void TryStartPublisherLocked(string path, StreamState stream)
         {
-            if (publisher != null || !haveVideoKeyframe || audioInputFormat == null)
+            if (stream.Publisher != null || !stream.HaveVideoKeyframe || stream.AudioInputFormat == null)
                 return;
 
-            publisher = new Publisher(
+            var newPublisher = new Publisher(
                 rtspPort,
-                videoInputFormat,
-                audioInputFormat,
-                audioDecoder);
+                path,
+                stream.VideoInputFormat,
+                stream.AudioInputFormat);
 
-            foreach (byte[] frame in pendingVideo)
+            try
             {
-                if (!publisher.TryPushVideo(frame))
-                    throw new IOException("Unable to queue initial video for FFmpeg");
+                foreach (byte[] frame in stream.PendingVideo)
+                {
+                    if (!newPublisher.TryPushVideo(frame))
+                        throw new IOException("Unable to queue initial video for FFmpeg");
+                }
+                foreach (byte[] frame in stream.PendingAudio)
+                {
+                    if (!newPublisher.TryPushAudio(frame))
+                        throw new IOException("Unable to queue initial audio for FFmpeg");
+                }
+
+                stream.Publisher = newPublisher;
             }
-            foreach (byte[] frame in pendingAudio)
+            catch
             {
-                if (!publisher.TryPushAudio(frame))
-                    throw new IOException("Unable to queue initial audio for FFmpeg");
+                newPublisher.Dispose();
+                throw;
             }
 
-            pendingVideo.Clear();
-            pendingAudio.Clear();
+            stream.PendingVideo.Clear();
+            stream.PendingAudio.Clear();
             Console.Error.WriteLine(
-                $"[PUBLISH] FFmpeg started video={videoInputFormat} audio={audioDecoder ?? audioInputFormat}");
+                $"[PUBLISH:{path}] FFmpeg started video={stream.VideoInputFormat} " +
+                $"audio={stream.AudioInputFormat}");
+        }
+
+        private StreamState GetStreamLocked(string path)
+        {
+            if (!streams.TryGetValue(path, out StreamState stream))
+            {
+                stream = new StreamState();
+                streams.Add(path, stream);
+            }
+            return stream;
         }
 
         private string BuildMediaMtxConfig()
@@ -235,13 +273,13 @@ namespace V380Decoder.src
             config.AppendLine("    ips: [\"127.0.0.1\", \"::1\"]");
             config.AppendLine("    permissions:");
             config.AppendLine("      - action: publish");
-            config.AppendLine("        path: live");
+            config.AppendLine("        path: ~^live(?:-[a-z0-9_-]+)?$");
             config.AppendLine($"  - user: {readUser}");
             config.AppendLine($"    pass: {readPassword}");
             config.AppendLine("    ips: []");
             config.AppendLine("    permissions:");
             config.AppendLine("      - action: read");
-            config.AppendLine("        path: live");
+            config.AppendLine("        path: ~^live(?:-[a-z0-9_-]+)?$");
             config.AppendLine("rtsp: true");
             config.AppendLine("rtspTransports: [tcp]");
             config.AppendLine($"rtspAddress: :{rtspPort}");
@@ -252,7 +290,7 @@ namespace V380Decoder.src
             config.AppendLine("srt: false");
             config.AppendLine("moq: false");
             config.AppendLine("paths:");
-            config.AppendLine("  live:");
+            config.AppendLine("  all_others:");
             config.AppendLine("    source: publisher");
             config.AppendLine("    overridePublisher: true");
             return config.ToString();
@@ -327,20 +365,24 @@ namespace V380Decoder.src
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
 
-            Publisher oldPublisher;
+            Publisher[] oldPublishers;
             Process oldMediaMtx;
             string oldConfigDirectory;
             lock (stateLock)
             {
-                oldPublisher = publisher;
-                publisher = null;
+                oldPublishers = streams.Values
+                    .Select(stream => stream.Publisher)
+                    .Where(publisher => publisher != null)
+                    .ToArray();
+                streams.Clear();
                 oldMediaMtx = mediaMtxProcess;
                 mediaMtxProcess = null;
                 oldConfigDirectory = configDirectory;
                 configDirectory = null;
             }
 
-            oldPublisher?.Dispose();
+            foreach (Publisher publisher in oldPublishers)
+                publisher.Dispose();
             StopProcess(oldMediaMtx);
 
             if (!string.IsNullOrEmpty(oldConfigDirectory))
@@ -362,10 +404,38 @@ namespace V380Decoder.src
             process.Dispose();
         }
 
+        private sealed class StreamState
+        {
+            public readonly List<byte[]> PendingVideo = new();
+            public readonly List<byte[]> PendingAudio = new();
+            public Publisher Publisher;
+            public string VideoInputFormat;
+            public string AudioInputFormat;
+            public bool HaveVideoKeyframe;
+        }
+
+        private sealed class PathSink : IMediaSink
+        {
+            private readonly MediaMtxBridge owner;
+            private readonly string path;
+
+            public PathSink(MediaMtxBridge owner, string path)
+            {
+                this.owner = owner;
+                this.path = path;
+            }
+
+            public void PushVideo(FrameData frame) => owner.PushVideo(path, frame);
+            public void PushAudio(FrameData frame) => owner.PushAudio(path, frame);
+            public void Reset() => owner.Reset(path);
+        }
+
         private sealed class Publisher : IDisposable
         {
-            private const int VideoQueueCapacity = 48;
-            private const int AudioQueueCapacity = 64;
+            // These queues must hold every frame accepted by the corresponding
+            // pre-publisher queues, plus a small connection-startup margin.
+            private const int VideoQueueCapacity = MaxPendingVideoFrames + 32;
+            private const int AudioQueueCapacity = MaxPendingAudioFrames + 32;
 
             private readonly BlockingCollection<byte[]> videoQueue = new(VideoQueueCapacity);
             private readonly BlockingCollection<byte[]> audioQueue = new(AudioQueueCapacity);
@@ -378,7 +448,7 @@ namespace V380Decoder.src
             private TcpClient audioClient;
             private int disposed;
 
-            public Publisher(int rtspPort, string videoFormat, string audioFormat, string audioCodec)
+            public Publisher(int rtspPort, string path, string videoFormat, string audioFormat)
             {
                 videoListener = CreateListener(out int videoPort);
                 audioListener = CreateListener(out int audioPort);
@@ -408,24 +478,20 @@ namespace V380Decoder.src
                     "-f", videoFormat,
                     "-i", $"tcp://127.0.0.1:{videoPort}",
                     "-thread_queue_size", "64",
-                    "-use_wallclock_as_timestamps", "1",
                     "-f", audioFormat,
-                    "-ar", "8000", "-ac", "1");
-
-                if (audioCodec != null)
-                    AddArguments(startInfo, "-c:a", audioCodec);
-
-                AddArguments(startInfo,
+                    "-ar", "8000", "-ac", "1",
                     "-i", $"tcp://127.0.0.1:{audioPort}",
                     "-map", "0:v:0", "-map", "1:a:0",
                     "-c:v", "copy",
-                    "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1",
-                    "-af", "aresample=async=1000:min_hard_comp=0.100",
+                    // Old V380 ADPCM has already been decoded and paced by
+                    // OldImaAudioDecoder. Preserve its 8 kHz PCMA samples and
+                    // timestamps generated from the sample count.
+                    "-c:a", "copy",
                     "-fps_mode", "passthrough",
                     "-max_interleave_delta", "100000",
                     "-muxdelay", "0",
                     "-f", "rtsp", "-rtsp_transport", "tcp",
-                    $"rtsp://127.0.0.1:{rtspPort}/live");
+                    $"rtsp://127.0.0.1:{rtspPort}/{path}");
 
                 process = new Process { StartInfo = startInfo };
                 try

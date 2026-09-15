@@ -80,6 +80,8 @@ if (args.Length > 0)
 
 
     bool enableWebServer = enableApi || enableOnvif;
+    var cts = new CancellationTokenSource();
+    var streamCatalog = new V380StreamCatalog();
     var client = new V380Client(
         sourceStream == SourceStream.Cloud ? relayIp : ip,
         port,
@@ -92,7 +94,11 @@ if (args.Length > 0)
     );
 
     IMediaSink mediaSink = null;
+    IMediaSink lowMediaSink = null;
     MediaMtxBridge mediaBridge = null;
+    V380Client lowStreamClient = null;
+    Task lowStreamTask = null;
+    int lowStreamStarted = 0;
     WebServer webServer = null;
     if (outputMode == OutputMode.Rtsp)
     {
@@ -102,7 +108,57 @@ if (args.Length > 0)
             username,
             password);
         mediaBridge.Start();
-        mediaSink = mediaBridge;
+        mediaSink = mediaBridge.CreateSink("live");
+
+        if (enableOnvif)
+        {
+            lowMediaSink = mediaBridge.CreateSink("live-low");
+            lowStreamClient = new V380Client(
+                sourceStream == SourceStream.Cloud ? relayIp : ip,
+                port,
+                (uint)id,
+                username,
+                password,
+                sourceStream,
+                outputMode,
+                enableMjpeg: false,
+                streamQuality: 0,
+                streamPath: "live-low",
+                enableSnapshots: false);
+
+            lowStreamClient.StreamNegotiated = profile =>
+            {
+                bool accepted = streamCatalog.RegisterAdditional(profile);
+                streamCatalog.MarkDiscoveryComplete();
+                if (accepted && !string.IsNullOrEmpty(profile.Encoding))
+                {
+                    Console.Error.WriteLine(
+                        $"[ONVIF] discovered {profile.DisplayName}: " +
+                        $"{profile.Width}x{profile.Height}@{profile.FrameRate} " +
+                        $"{profile.Encoding} -> /{profile.Path}");
+                }
+                return accepted;
+            };
+            lowStreamClient.StreamUnavailable = streamCatalog.MarkDiscoveryComplete;
+        }
+
+        client.StreamNegotiated = profile =>
+        {
+            bool accepted = streamCatalog.RegisterPrimary(profile);
+            if (accepted && !string.IsNullOrEmpty(profile.Encoding))
+            {
+                Console.Error.WriteLine(
+                    $"[ONVIF] discovered {profile.DisplayName}: " +
+                    $"{profile.Width}x{profile.Height}@{profile.FrameRate} -> /{profile.Path}");
+            }
+
+            if (lowStreamClient != null && Interlocked.Exchange(ref lowStreamStarted, 1) == 0)
+            {
+                lowStreamTask = Task.Run(() => lowStreamClient.Run(lowMediaSink, cts.Token));
+            }
+
+            return accepted;
+        };
 
         webServer = new(
             httpPort,
@@ -113,7 +169,8 @@ if (args.Length > 0)
             enableMjpeg,
             secure,
             username,
-            password);
+            password,
+            streamCatalog);
         webServer.Start();
     }
 
@@ -123,8 +180,6 @@ if (args.Length > 0)
         onvifDiscovery = new(httpPort);
         onvifDiscovery.Start();
     }
-
-    var cts = new CancellationTokenSource();
 
     Console.CancelKeyPress += (sender, e) =>
      {
@@ -149,9 +204,12 @@ if (args.Length > 0)
     finally
     {
         Console.Error.WriteLine("[V380] Cleaning up...");
-        mediaBridge?.Dispose();
+        cts.Cancel();
         webServer?.Stop();
         client.Dispose();
+        lowStreamClient?.Dispose();
+        try { lowStreamTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
+        mediaBridge?.Dispose();
         onvifDiscovery?.Dispose();
     }
 

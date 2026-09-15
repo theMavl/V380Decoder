@@ -20,6 +20,7 @@ namespace V380Decoder.src
         private readonly bool secure;
         private readonly string username;
         private readonly string password;
+        private readonly V380StreamCatalog streamCatalog;
         private WebApplication app;
         public WebServer(
             int httpPort,
@@ -30,7 +31,8 @@ namespace V380Decoder.src
             bool enableMjpeg,
             bool secure,
             string username,
-            string password)
+            string password,
+            V380StreamCatalog streamCatalog)
         {
             this.httpPort = httpPort;
             this.rtspPort = rtspPort;
@@ -41,6 +43,7 @@ namespace V380Decoder.src
             this.secure = secure;
             this.username = username;
             this.password = password;
+            this.streamCatalog = streamCatalog;
         }
 
         public void Start()
@@ -218,7 +221,17 @@ namespace V380Decoder.src
                 action = action.Substring(4);
 
 
-            string resp = OnvifHandler.Handle(action, body, ctx, client, httpPort, rtspPort, secure, username, password);
+            string resp = OnvifHandler.Handle(
+                action,
+                body,
+                ctx,
+                client,
+                httpPort,
+                rtspPort,
+                secure,
+                username,
+                password,
+                streamCatalog);
 
             LogUtils.debug($"[ONVIF] response: {(resp.Length > 300 ? resp[..300] + "..." : resp)}");
 

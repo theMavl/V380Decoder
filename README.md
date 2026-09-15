@@ -73,6 +73,12 @@ In RTSP mode the application sends the camera's elementary video and audio
 streams through FFmpeg and publishes them to the bundled MediaMTX server.
 The legacy in-process RTP/RTCP implementation is not used.
 
+When ONVIF is enabled, the application also probes the V380 low-quality
+selector after the primary stream is negotiated. ONVIF advertises the
+additional profile only when the camera accepts it and returns a distinct
+resolution/frame-rate combination. Profile dimensions and frame rate come
+from the camera's stream-login response; they are not configured locally.
+
 ```bash
 # Default (RTSP mode)
 ./V380Decoder --id 12345678 --username admin --password password --ip 192.168.1.2
@@ -84,6 +90,12 @@ The legacy in-process RTP/RTCP implementation is not used.
 **Access stream:**
 ```
 rtsp://192.168.1.3:8554/live
+```
+
+If a distinct low-quality stream is discovered, its URI is:
+
+```text
+rtsp://192.168.1.3:8554/live-low
 ```
 
 **Access snapshot:**

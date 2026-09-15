@@ -39,7 +39,7 @@ namespace V380Decoder.src
             snapshotManager.SetMjpegActive(enableMjpeg);
         }
 
-        public void Run(RtspServer rtsp, CancellationToken ct)
+        public void Run(IMediaSink mediaSink, CancellationToken ct)
         {
             SetDeviceInfo();
             while (!ct.IsCancellationRequested)
@@ -63,7 +63,7 @@ namespace V380Decoder.src
                         continue;
                     }
 
-                    ReceiveFrames(mode, rtsp, ct);
+                    ReceiveFrames(mode, mediaSink, ct);
                 }
                 catch (OperationCanceledException)
                 {
@@ -310,7 +310,7 @@ namespace V380Decoder.src
             return SendData(streamStream, cmd303);
         }
 
-        public void ReceiveFrames(OutputMode mode, RtspServer rtsp, CancellationToken ct)
+        public void ReceiveFrames(OutputMode mode, IMediaSink mediaSink, CancellationToken ct)
         {
             bool needDecrypt = deviceVersion > 30;
 
@@ -337,14 +337,6 @@ namespace V380Decoder.src
                     stdout.Write(payload, 0, payload.Length);
                     stdout.Flush();
                 }
-                else if (mode == OutputMode.Rtsp)
-                {
-                    rtsp?.PushAudio(new FrameData
-                    {
-                        RawType = 0x16,
-                        Payload = payload
-                    });
-                }
             }
 
             void ResetOldAudioDecoder()
@@ -363,6 +355,7 @@ namespace V380Decoder.src
                     {
                         Console.Error.WriteLine($"[STREAM] lost, reconnecting... ");
                         ResetOldAudioDecoder();
+                        mediaSink?.Reset();
                         audioFrags.Clear();
                         collectingOldAudio = false;
                         nextOldAudioFragment = 0;
@@ -486,7 +479,7 @@ namespace V380Decoder.src
                         }
                         else if (mode == OutputMode.Rtsp)
                         {
-                            rtsp?.PushVideo(fd);
+                            mediaSink?.PushVideo(fd);
                         }
                     }
 
@@ -511,6 +504,9 @@ namespace V380Decoder.src
                             collectingOldAudio = false;
                             nextOldAudioFragment = 0;
                             ResetOldAudioDecoder();
+                            if (mode == OutputMode.Rtsp)
+                                mediaSink?.Reset();
+                            needReconnect = true;
                             continue;
                         }
 
@@ -530,9 +526,26 @@ namespace V380Decoder.src
                         if (full.Length <= oldAudioHeaderSize)
                             continue;
 
-                        oldAudioDecoder ??= new OldImaAudioDecoder(EmitOldAudio);
-                        if (!oldAudioDecoder.WriteFrame(full, oldAudioHeaderSize))
-                            throw new IOException("FFmpeg ADPCM decoder stopped");
+                        if (mode == OutputMode.Audio)
+                        {
+                            oldAudioDecoder ??= new OldImaAudioDecoder(EmitOldAudio);
+                            if (!oldAudioDecoder.WriteFrame(full, oldAudioHeaderSize))
+                                throw new IOException("FFmpeg ADPCM decoder stopped");
+                        }
+                        else if (mode == OutputMode.Rtsp)
+                        {
+                            // Preserve the exact old implementation boundary:
+                            // strip 20 V380 bytes, then let the publisher's
+                            // FFmpeg adpcm_ima_ws decoder consume one continuous
+                            // byte stream.
+                            byte[] payload = new byte[full.Length - oldAudioHeaderSize];
+                            Array.Copy(full, oldAudioHeaderSize, payload, 0, payload.Length);
+                            mediaSink?.PushAudio(new FrameData
+                            {
+                                RawType = 0x16,
+                                Payload = payload
+                            });
+                        }
                     }
 
                     // AUDIO  0x1A
@@ -583,7 +596,7 @@ namespace V380Decoder.src
                         }
                         else if (mode == OutputMode.Rtsp)
                         {
-                            rtsp?.PushAudio(fd);
+                            mediaSink?.PushAudio(fd);
                         }
                     }
                     else if (type == 0x5B)
@@ -607,6 +620,8 @@ namespace V380Decoder.src
             finally
             {
                 ResetOldAudioDecoder();
+                if (!ct.IsCancellationRequested)
+                    mediaSink?.Reset();
             }
         }
 

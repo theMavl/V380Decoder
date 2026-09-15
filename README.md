@@ -4,7 +4,7 @@ Extract video and audio from encrypted V380 camera. Newer V380 cameras use encry
 
 This is a port of [prsyahmi/v380](https://github.com/prsyahmi/v380) with significant enhancements:
 - ✅ Audio and video decryption
-- ✅ RTSP server output
+- ✅ RTSP output through FFmpeg and MediaMTX
 - ✅ ONVIF support
 - ✅ Web UI and REST API for camera control
 - ✅ Snapshot API
@@ -25,7 +25,8 @@ This is a port of [prsyahmi/v380](https://github.com/prsyahmi/v380) with signifi
 ## Requirements
 
 - .NET 10 SDK (for building from source)
-- FFmpeg (optional, for snapshot or piping video/audio output)
+- FFmpeg (required for RTSP, snapshots and audio decoding)
+- MediaMTX (required for RTSP; included in the Docker image)
 
 ## Command Line Arguments
 
@@ -37,7 +38,7 @@ This is a port of [prsyahmi/v380](https://github.com/prsyahmi/v380) with signifi
 | `--ip` | - | ⚠️ If LAN | Camera IP address (required for LAN source) |
 | `--port` | `8800` | No | Camera port |
 | `--source` | `lan` | No | Connection source: `lan` or `cloud` |
-| `--output` | `rtsp` | No | Output mode: `video`, `audio`, or `rtsp` |
+| `--output` | `rtsp` | No | Output mode: `video`, `audio`, or MediaMTX-backed `rtsp` |
 | `--enable-onvif` | `false` | No | Enable ONVIF server (requires `output=rtsp`) |
 | `--enable-api` | `false` | No | Enable Web UI and REST API |
 | `--enable-mjpeg` | `false` | No | Enable Mjpeg stream |
@@ -67,6 +68,11 @@ Download Latest [Release](https://github.com/PyanSofyan/V380decoder/releases/lat
 ```
 
 ### RTSP Server
+
+In RTSP mode the application sends the camera's elementary video and audio
+streams through FFmpeg and publishes them to the bundled MediaMTX server.
+The legacy in-process RTP/RTCP implementation is not used.
+
 ```bash
 # Default (RTSP mode)
 ./V380Decoder --id 12345678 --username admin --password password --ip 192.168.1.2

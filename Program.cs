@@ -91,16 +91,18 @@ if (args.Length > 0)
         enableMjpeg
     );
 
-    RtspServer rtsp = null;
+    IMediaSink mediaSink = null;
+    MediaMtxBridge mediaBridge = null;
     WebServer webServer = null;
     if (outputMode == OutputMode.Rtsp)
     {
-        rtsp = new(
+        mediaBridge = new(
             rtspPort,
             secure,
             username,
             password);
-        rtsp.Start();
+        mediaBridge.Start();
+        mediaSink = mediaBridge;
 
         webServer = new(
             httpPort,
@@ -138,7 +140,7 @@ if (args.Length > 0)
 
     try
     {
-        client.Run(rtsp, cts.Token);
+        client.Run(mediaSink, cts.Token);
     }
     catch (OperationCanceledException)
     {
@@ -147,7 +149,7 @@ if (args.Length > 0)
     finally
     {
         Console.Error.WriteLine("[V380] Cleaning up...");
-        rtsp?.Dispose();
+        mediaBridge?.Dispose();
         webServer?.Stop();
         client.Dispose();
         onvifDiscovery?.Dispose();
@@ -194,7 +196,7 @@ OUTPUT OPTIONS:
   --output <type>        Output type: 'video', 'audio', or 'rtsp' (default: rtsp)
                          video - Raw H.264 video to stdout (pipe to ffplay)
                          audio - Raw G.711 audio to stdout (pipe to ffplay)
-                         rtsp  - RTSP stream server (default)
+                         rtsp  - FFmpeg + MediaMTX RTSP stream (default)
 
   --rtsp-port <number>   RTSP server port when output=rtsp (default: 8554)
                          Example: --rtsp-port 8554

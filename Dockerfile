@@ -1,3 +1,5 @@
+FROM bluenviron/mediamtx:1.21.0 AS mediamtx
+
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY *.csproj .
@@ -11,5 +13,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app .
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 EXPOSE 8554/tcp 8080/tcp
 ENTRYPOINT ["./V380Decoder"]

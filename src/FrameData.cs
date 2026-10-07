@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace V380Decoder.src
 {
     public class FrameData
@@ -8,6 +10,10 @@ namespace V380Decoder.src
         public ushort FrameRate;
         public ulong Timestamp;
         public byte[] Payload;
+        public long ArrivalTimestamp { get; set; } = Stopwatch.GetTimestamp();
+        public int SampleCount { get; set; }
+        public int Epoch { get; set; }
+        public bool Discontinuity { get; set; }
         public bool IsKeyframe => RawType == 0x00 || RawType == 0x28;
     }
 }

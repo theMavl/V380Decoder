@@ -1,0 +1,7 @@
+.git
+captures
+**/bin
+**/obj
+artifacts
+**/__pycache__
+CODEX

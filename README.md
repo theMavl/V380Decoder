@@ -272,6 +272,54 @@ sudo docker build --no-cache -t v380decoder .
 docker run -d --restart unless-stopped --network host v380decoder --id 12345678 --username admin --password password --ip 192.168.1.2 --enable-onvif --enable-api
 ```
 
+### Offline audio validation
+
+Run all compile, decoder, sample-clock, queue/stall, epoch and replay checks with
+one command from the repository root:
+
+```bash
+bash tools/check_audio_rewrite.sh --docker
+```
+
+This builds the separate `v380decoder:audio-validation` image using
+`Dockerfile.validation` (SDK, GStreamer development headers and runtime plugins,
+FFmpeg and Python). The tests run with `--network none`; any failed check returns
+a nonzero exit status. The production `v380decoder:latest` image is unaffected.
+Building the validation image needs access to package/image registries.
+
+The runner generates deterministic, safe fixtures containing no camera data or
+credentials: 650 IMA blocks, an independent FFmpeg PCM reference, batched
+timestamps and a minimal synthetic `V380DMP1` stream. The minimal video payloads
+exercise ingress/queue logic; native H.264/H.265 pipeline construction is checked
+separately. Private camera captures remain ignored and are excluded from the
+validation build context. To additionally check the existing local golden
+capture, mount its directory explicitly and read-only after the build:
+
+```bash
+docker run --rm --network none \
+  --security-opt label=disable \
+  --mount type=bind,src="$PWD/captures",dst=/fixtures,readonly \
+  -e V380_LOCAL_FIXTURES=/fixtures v380decoder:audio-validation
+```
+
+On Fedora with SELinux, `--security-opt label=disable` lets the container read
+this read-only bind mount without relabeling the private capture files.
+
+Missing requested private fixtures fail the run; without that variable the
+runner reports that only generated fixtures were checked. Native stall tests use
+the production feeder threads with a controlled blocking consumer and condition
+barriers, verifying independent progress, live-edge recovery, GOP/DISCONT and
+drop counters. They do not replace long-run camera/RTSP transport validation.
+
+Audio frame IDs are global media IDs, so the sample clock accepts the observed
+3/4 cadence instead of requiring `+1`; step 5 is tolerated as interleave jitter.
+A step of 6 or more indicates at least two global media-ID periods between audio
+blocks and requests a new publisher epoch anchored to source time, including
+during clock bootstrap. Normal IDs, `uint` wraparound, and batched timestamps
+remain continuous. Unknown firmware with a wider legitimate ID cadence may
+require a new capture to refine this policy; indistinguishable loss with absent
+IDs cannot be reconstructed from timestamps alone.
+
 ## Acknowledgements
 
 - [prsyahmi/v380](https://github.com/prsyahmi/v380) - Original V380 reverse engineering work

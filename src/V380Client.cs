@@ -29,6 +29,7 @@ namespace V380Decoder.src
         private bool streamProfileRejected = false;
         private string detectedVideoEncoding = string.Empty;
         private DeviceInfo deviceInfo;
+        private int mediaEpoch;
 
         public Func<V380StreamProfile, bool> StreamNegotiated { get; set; }
         public Action StreamUnavailable { get; set; }
@@ -385,11 +386,14 @@ namespace V380Decoder.src
 
         public void ReceiveFrames(OutputMode mode, IMediaSink mediaSink, CancellationToken ct)
         {
+            mediaEpoch++;
             bool needDecrypt = deviceVersion > 30;
 
             var videoFrags = new List<byte>();
             var audioFrags = new List<byte>();
             ushort videoTotal = 0, audioTotal = 0;
+            ushort nextVideoFragment = 0;
+            bool collectingVideo = false;
             ushort nextOldAudioFragment = 0;
             int oldAudioBlockSize = 0;
             bool collectingOldAudio = false;
@@ -413,13 +417,20 @@ namespace V380Decoder.src
                     {
                         Console.Error.WriteLine($"[STREAM] lost, reconnecting... ");
                         mediaSink?.Reset();
+                        videoFrags.Clear();
+                        videoTotal = 0;
+                        nextVideoFragment = 0;
+                        collectingVideo = false;
                         audioFrags.Clear();
+                        audioTotal = 0;
                         collectingOldAudio = false;
                         nextOldAudioFragment = 0;
                         oldAudioBlockSize = 0;
+                        oldAudioFormatLogged = false;
                         try { streamStream?.Close(); streamClient?.Close(); } catch { }
                         if (!StreamLogin()) break;
                         if (!StartStream()) break;
+                        mediaEpoch++;
                         needReconnect = false;
                     }
 
@@ -459,12 +470,30 @@ namespace V380Decoder.src
                     // VIDEO  0x00=I-frame  0x01=P-frame  0x28/0x29=alt-video (fw v32+)
                     if (type == 0x00 || type == 0x01 || type == 0x28 || type == 0x29)
                     {
-                        if (curFrame == 0) { videoFrags.Clear(); videoTotal = totalFrame; }
-                        if (totalFrame != videoTotal) { videoFrags.Clear(); videoTotal = totalFrame; }
+                        if (curFrame == 0)
+                        {
+                            videoFrags.Clear();
+                            videoTotal = totalFrame;
+                            nextVideoFragment = 0;
+                            collectingVideo = true;
+                        }
+                        if (!collectingVideo || totalFrame != videoTotal ||
+                            curFrame != nextVideoFragment)
+                        {
+                            Console.Error.WriteLine(
+                                $"[VIDEO] fragment discontinuity total={totalFrame} cur={curFrame} expected={nextVideoFragment}; dropping access unit");
+                            videoFrags.Clear();
+                            collectingVideo = false;
+                            if (mode == OutputMode.Rtsp)
+                                mediaSink?.Reset();
+                            continue;
+                        }
 
                         for (int i = 0; i < payLen; i++) videoFrags.Add(payloadBuf[i]);
+                        nextVideoFragment++;
 
-                        if (curFrame != totalFrame - 1) continue;
+                        if (nextVideoFragment != totalFrame) continue;
+                        collectingVideo = false;
                         if (videoFrags.Count < 16) { videoFrags.Clear(); continue; }
 
                         byte[] full = videoFrags.ToArray();
@@ -527,7 +556,8 @@ namespace V380Decoder.src
                             FrameType = frameType,
                             FrameRate = frameRate,
                             Timestamp = timestamp,
-                            Payload = payload
+                            Payload = payload,
+                            Epoch = mediaEpoch
                         };
 
                         string encoding = type == 0x28 || type == 0x29 ? "H265" : "H264";
@@ -665,7 +695,8 @@ namespace V380Decoder.src
                                 FrameType = frameType,
                                 FrameRate = frameRate,
                                 Timestamp = timestamp,
-                                Payload = payload
+                                Payload = payload,
+                                Epoch = mediaEpoch
                             });
                         }
                     }
@@ -710,7 +741,8 @@ namespace V380Decoder.src
                             FrameType = frameType,
                             FrameRate = frameRate,
                             Timestamp = timestamp,
-                            Payload = payload
+                            Payload = payload,
+                            Epoch = mediaEpoch
                         };
 
                         if (mode == OutputMode.Audio)

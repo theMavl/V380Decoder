@@ -59,12 +59,21 @@ namespace V380Decoder.src
                 lock (stateLock)
                 {
                     StreamState stream = GetStreamLocked("live");
+                    Publisher publisher = stream.Publisher;
+                    Publisher.BridgePacket[] queuedAudio = publisher?.audioQueue.ToArray() ?? [];
+                    Publisher.BridgePacket[] queuedVideo = publisher?.videoQueue.ToArray() ?? [];
+                    ulong audioDuration = queuedAudio.Aggregate(0UL, (sum, packet) =>
+                        checked(sum + (packet.Duration == ulong.MaxValue ? 0 : packet.Duration)));
+                    ulong videoSpan = queuedVideo.Length > 1 &&
+                        queuedVideo[^1].Pts > queuedVideo[0].Pts
+                            ? queuedVideo[^1].Pts - queuedVideo[0].Pts : 0;
                     return new ValidationMediaState(stream.ResetCount, stream.PublisherStarts,
                         stream.Publisher?.audioClock.TimelineSamples ?? 0,
                         stream.Publisher?.audioQueueDrops ?? 0,
                         stream.Publisher?.videoQueueDrops ?? 0,
-                        stream.Publisher?.audioQueue.Count ?? 0,
-                        stream.Publisher?.videoQueue.Count ?? 0);
+                        queuedAudio.Length, queuedVideo.Length, audioDuration, videoSpan,
+                        queuedAudio.Select(packet => packet.Pts).ToArray(),
+                        queuedVideo.Select(packet => packet.Pts).ToArray());
                 }
             }
         }
@@ -654,8 +663,10 @@ namespace V380Decoder.src
             private const int DiscontinuityFlag = 2;
             private const ulong AudioHardLimitNs = 280_000_000;
             private const ulong VideoHardLimitNs = 500_000_000;
-            internal readonly BlockingCollection<BridgePacket> videoQueue = new(2);
-            internal readonly BlockingCollection<BridgePacket> audioQueue = new(2);
+            private const int AudioQueueSafetyCapacity = 16;
+            private const int VideoQueueSafetyCapacity = 32;
+            internal readonly BlockingCollection<BridgePacket> videoQueue = new(VideoQueueSafetyCapacity);
+            internal readonly BlockingCollection<BridgePacket> audioQueue = new(AudioQueueSafetyCapacity);
             private readonly object timestampLock = new();
             private readonly object inputLock = new();
             private readonly Stream input;
@@ -683,6 +694,8 @@ namespace V380Decoder.src
             private long maxWriteMicroseconds;
             private long maxAudioQueueAgeMs;
             private long maxVideoQueueAgeMs;
+            private long lastAudioOverflowLogTicks;
+            private long videoWaitingDropEvents;
             private int writerFailed;
             private int disposed;
 
@@ -766,6 +779,9 @@ namespace V380Decoder.src
                     if (videoWaitingForKeyframe && !frame.IsKeyframe)
                     {
                         videoQueueDrops++;
+                        videoWaitingDropEvents++;
+                        if (videoWaitingDropEvents == 1 || videoWaitingDropEvents % 30 == 0)
+                            Console.Error.WriteLine($"[MEDIA-DROP:{path}] track=video reason=waiting_for_keyframe dropped={videoQueueDrops} event={videoWaitingDropEvents}");
                         return true;
                     }
                     ulong pts = TimestampToNanoseconds(frame.Timestamp);
@@ -849,10 +865,10 @@ namespace V380Decoder.src
                     Console.Error.WriteLine("[MEDIA-DROP] track=audio reason=block_exceeds_hard_limit");
                     return false;
                 }
-                bool overLimit = video
+                bool overLimit = queued.Length >= (video ? VideoQueueSafetyCapacity : AudioQueueSafetyCapacity) || (video
                     ? queued.Length > 0 && packet.Pts > queued[0].Pts &&
                         packet.Pts - queued[0].Pts > VideoHardLimitNs
-                    : queuedDuration + packetDuration > hardLimit;
+                    : queuedDuration + packetDuration > hardLimit);
                 if (!overLimit && target.TryAdd(packet)) return true;
 
                 int dropped = 0;
@@ -864,6 +880,7 @@ namespace V380Decoder.src
                     if ((packet.Flags & KeyframeFlag) == 0)
                     {
                         videoQueueDrops++;
+                        videoWaitingDropEvents++;
                         Console.Error.WriteLine($"[MEDIA-DROP:{path}] track=video reason=queue_overflow dropped={dropped + 1} waiting_for_keyframe");
                         return true;
                     }
@@ -872,9 +889,22 @@ namespace V380Decoder.src
                 else
                     audioQueueDrops += dropped;
 
-                Console.Error.WriteLine($"[MEDIA-DROP:{path}] track={(video ? "video" : "audio")} reason=queue_overflow dropped={dropped} latestPts={packet.Pts}");
+                if (video)
+                    Console.Error.WriteLine($"[MEDIA-DROP:{path}] track=video reason=queue_overflow dropped={dropped} latestPts={packet.Pts}");
+                else
+                    LogAudioOverflowIfDue(dropped, packet.Pts);
                 packet = packet with { Flags = packet.Flags | DiscontinuityFlag };
                 return target.TryAdd(packet);
+            }
+
+            private void LogAudioOverflowIfDue(int dropped, ulong latestPts)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (lastAudioOverflowLogTicks != 0 &&
+                    Stopwatch.GetElapsedTime(lastAudioOverflowLogTicks, now) < TimeSpan.FromSeconds(1))
+                    return;
+                lastAudioOverflowLogTicks = now;
+                Console.Error.WriteLine($"[MEDIA-DROP:{path}] track=audio reason=queue_overflow dropped={dropped} totalDropped={audioQueueDrops} latestPts={latestPts}");
             }
 
             private ulong TimestampToNanoseconds(ulong timestamp)
@@ -1032,5 +1062,7 @@ namespace V380Decoder.src
     public sealed record ValidatedMediaPacket(bool Audio, int Flags, ulong Pts,
         ulong Duration, byte[] Payload, string AudioFormat);
     public readonly record struct ValidationMediaState(long Resets, long PublisherStarts,
-        long TimelineSamples, long AudioDrops, long VideoDrops, int QueuedAudio, int QueuedVideo);
+        long TimelineSamples, long AudioDrops, long VideoDrops, int QueuedAudio, int QueuedVideo,
+        ulong QueuedAudioDurationNs, ulong QueuedVideoSpanNs,
+        ulong[] QueuedAudioPts, ulong[] QueuedVideoPts);
 }

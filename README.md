@@ -272,6 +272,16 @@ sudo docker build --no-cache -t v380decoder .
 docker run -d --restart unless-stopped --network host v380decoder --id 12345678 --username admin --password password --ip 192.168.1.2 --enable-onvif --enable-api
 ```
 
+For an environment-based local run, create the ignored `.env.live` from
+`.env.live.example`, fill it locally, then use:
+
+```bash
+docker run --rm --network host --env-file .env.live v380decoder
+```
+
+Explicit CLI options override matching `V380_*` environment values. The
+`.env.live` file is excluded from Docker build contexts and images.
+
 ### Offline audio validation
 
 Run all compile, decoder, sample-clock, queue/stall, epoch and replay checks with

@@ -4,6 +4,7 @@ static class OfflineValidationChecks
 {
     public static int Run()
     {
+        EnvironmentConfigurationChecks.Run();
         var emitted = new List<ValidatedMediaPacket>();
         using var bridge = MediaMtxBridge.CreateOfflineValidation(emitted.Add);
         IMediaSink sink = bridge.CreateSink("live");
@@ -12,43 +13,69 @@ static class OfflineValidationChecks
         bridge.DrainValidation();
         Assert(emitted.Count == 2 && emitted.Single(p => p.Audio).Payload.Length == 1010,
             "production decoder must emit 505 PCM samples");
-        // Stall audio while video progresses. Overflow keeps source sample PTS.
-        for (int i = 1; i <= 3; i++)
+        // Stall audio while video progresses. Four complete blocks span 252.5 ms
+        // and must fit beneath the 280 ms hard limit without packet-count drops.
+        for (int i = 1; i <= 4; i++)
         {
             sink.PushAudio(Audio(i));
-            sink.PushVideo(Video(i, true));
+            sink.PushVideo(Video(i, i == 1));
             bridge.DrainValidation("video");
         }
-        Assert(bridge.ValidationState.AudioDrops == 2 && bridge.ValidationState.QueuedAudio == 1,
-            "audio stall overflow counters/live edge");
+        var audioBeforeOverflow = bridge.ValidationState;
+        Assert(audioBeforeOverflow.AudioDrops == 0 && audioBeforeOverflow.QueuedAudio == 4 &&
+            audioBeforeOverflow.QueuedAudioDurationNs == 252_500_000 &&
+            audioBeforeOverflow.QueuedAudioPts.SequenceEqual(new ulong[] {
+                63_125_000, 126_250_000, 189_375_000, 252_500_000 }),
+            "four audio blocks / 252.5 ms must be preserved without overflow");
+        sink.PushAudio(Audio(5));
+        var audioAfterOverflow = bridge.ValidationState;
+        Assert(audioAfterOverflow.AudioDrops == 4 && audioAfterOverflow.QueuedAudio == 1 &&
+            audioAfterOverflow.QueuedAudioDurationNs == 63_125_000 &&
+            audioAfterOverflow.QueuedAudioPts.SequenceEqual(new ulong[] { 315_625_000 }),
+            "fifth audio block must drop four stale packets and preserve live-edge PTS");
         bridge.DrainValidation("audio");
         var last = emitted.Last();
-        Assert(last.Audio && last.Pts == 189_375_000 && (last.Flags & 2) != 0,
+        Assert(last.Audio && last.Pts == 315_625_000 && (last.Flags & 2) != 0,
             "audio overflow must retain gap and DISCONT");
-        sink.PushAudio(Audio(4));
+        sink.PushAudio(Audio(6));
         bridge.DrainValidation("audio");
-        Assert(emitted.Last().Pts == 252_500_000 && (emitted.Last().Flags & 2) == 0,
+        Assert(emitted.Last().Pts == 378_750_000 && (emitted.Last().Flags & 2) == 0,
             "no cumulative audio PTS subtraction");
-        // Stall video; the production GOP policy must reject deltas until key.
-        for (int i = 4; i <= 7; i++)
+
+        // A stalled video queue accepts the full 500 ms span, then discards
+        // the GOP when the next delta extends its range beyond the hard limit.
+        for (int i = 5; i <= 10; i++)
         {
-            sink.PushVideo(Video(i, false));
-            sink.PushAudio(Audio(i + 1));
-            bridge.DrainValidation("audio");
+            sink.PushVideo(Video(i, i == 5));
         }
-        Assert(bridge.ValidationState.VideoDrops == 4 && bridge.ValidationState.QueuedVideo == 0,
-            "video stall removes GOP and rejects following delta");
-        sink.PushVideo(Video(8, true));
+        var videoBeforeOverflow = bridge.ValidationState;
+        Assert(videoBeforeOverflow.VideoDrops == 0 && videoBeforeOverflow.QueuedVideo == 6 &&
+            videoBeforeOverflow.QueuedVideoSpanNs == 500_000_000 &&
+            videoBeforeOverflow.QueuedVideoPts.First() == 500_000_000 &&
+            videoBeforeOverflow.QueuedVideoPts.Last() == 1_000_000_000,
+            "video span through 500 ms must remain queued without overflow");
+        sink.PushVideo(Video(11, false));
+        Assert(bridge.ValidationState.VideoDrops == 7 && bridge.ValidationState.QueuedVideo == 0,
+            "over-limit video delta must drop the queued GOP and itself");
+        sink.PushVideo(Video(12, false));
+        Assert(bridge.ValidationState.VideoDrops == 8 && bridge.ValidationState.QueuedVideo == 0,
+            "deltas must remain discarded while waiting for a keyframe");
+        sink.PushVideo(Video(13, true));
         bridge.DrainValidation("video");
-        Assert(!emitted.Last().Audio && emitted.Last().Pts == 800_000_000 && (emitted.Last().Flags & 2) != 0,
+        Assert(!emitted.Last().Audio && emitted.Last().Pts == 1_300_000_000 &&
+            (emitted.Last().Flags & 3) == 3,
             "video recovery keyframe must be queued with DISCONT even when capacity is available");
+        sink.PushVideo(Video(14, true));
+        bridge.DrainValidation("video");
+        Assert(emitted.Last().Pts == 1_400_000_000 && (emitted.Last().Flags & 2) == 0,
+            "next video keyframe must not receive an unnecessary DISCONT");
         long samples = bridge.ValidationState.TimelineSamples;
         ExpectInvalid(() => sink.PushAudio(Audio(8)));
         Assert(bridge.ValidationState.TimelineSamples == samples, "duplicate cannot advance clock");
         ExpectInvalid(() => sink.PushAudio(new FrameData { RawType = 0x16, FrameId = 100,
             Timestamp = 1510, Payload = new byte[128] }));
         // Pending packets from the old epoch are discarded by the actual Reset.
-        sink.PushVideo(Video(9, true));
+        sink.PushVideo(Video(15, true));
         sink.Reset();
         emitted.Clear();
         sink.PushVideo(Video(0, false, 1));

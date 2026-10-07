@@ -57,3 +57,4 @@ nunit-*.xml
 captures/
 CODEX/
 __pycache__
+.env.live

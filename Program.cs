@@ -1,6 +1,6 @@
 ﻿using V380Decoder.src;
 
-if (args.Length > 0)
+if (args.Length > 0 || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("V380_ID")))
 {
     if (args.Contains("--help") || args.Contains("-h") || args.Contains("/?"))
     {
@@ -19,21 +19,33 @@ if (args.Length > 0)
         return;
     }
 
-    int id = ArgParser.GetArg(args, "--id", 0);
-    int port = ArgParser.GetArg(args, "--port", 8800);
-    string username = ArgParser.GetArg(args, "--username", "admin");
-    string password = ArgParser.GetArg(args, "--password", "");
-    string ip = ArgParser.GetArg(args, "--ip", "");
-    string source = ArgParser.GetArg(args, "--source", "lan");
-    string output = ArgParser.GetArg(args, "--output", "rtsp");
-    bool enableOnvif = ArgParser.GetArg(args, "--enable-onvif", false);
-    bool enableApi = ArgParser.GetArg(args, "--enable-api", false);
-    bool enableMjpeg = ArgParser.GetArg(args, "--enable-mjpeg", false);
-    int rtspPort = ArgParser.GetArg(args, "--rtsp-port", 8554);
-    int httpPort = ArgParser.GetArg(args, "--http-port", 8080);
-    string audioDumpPath = ArgParser.GetArg(args, "--audio-dump", "");
-    bool secure = ArgParser.GetArg(args, "--secure", false);
-    bool debug = ArgParser.GetArg(args, "--debug", false);
+    AppOptions options;
+    try
+    {
+        options = AppOptions.Parse(args);
+    }
+    catch (ArgumentException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        Environment.ExitCode = 2;
+        return;
+    }
+
+    int id = options.Id;
+    int port = options.Port;
+    string username = options.Username;
+    string password = options.Password;
+    string ip = options.Ip;
+    string source = options.Source;
+    string output = options.Output;
+    bool enableOnvif = options.EnableOnvif;
+    bool enableApi = options.EnableApi;
+    bool enableMjpeg = options.EnableMjpeg;
+    int rtspPort = options.RtspPort;
+    int httpPort = options.HttpPort;
+    string audioDumpPath = options.AudioDumpPath;
+    bool secure = options.Secure;
+    bool debug = options.Debug;
 
     if (source.Equals("lan", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(ip))
     {
@@ -220,7 +232,18 @@ if (args.Length > 0)
 }
 else
 {
+    try
+    {
+        _ = AppOptions.Parse(args);
+    }
+    catch (ArgumentException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        Environment.ExitCode = 2;
+        return;
+    }
     Console.Error.WriteLine("[V380] No arguments provided");
+    PrintHelp();
 }
 
 static void PrintHelp()

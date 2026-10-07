@@ -14,6 +14,7 @@
 #define FLAG_DISCONT 2
 #define AUDIO_HARD_NS (280U * GST_MSECOND)
 #define VIDEO_HARD_NS (500U * GST_MSECOND)
+#define NATIVE_QUEUE_SAFETY_PACKETS 64
 
 typedef struct {
     uint8_t type;
@@ -45,6 +46,7 @@ typedef struct {
     guint64 slow_pushes;
     guint64 max_push_us;
     guint64 max_age_ms;
+    gint64 last_audio_overflow_log_us;
 } PacketQueue;
 
 typedef struct {
@@ -167,9 +169,10 @@ static gboolean queue_push(PacketQueue *queue, Packet *packet)
     if (queue->video && queue->waiting_for_keyframe &&
         (packet->flags & FLAG_KEYFRAME) == 0) {
         queue->dropped_waiting++;
-        fprintf(stderr, "[BRIDGE-DROP] track=video reason=waiting_for_keyframe dropped=%"
-                G_GUINT64_FORMAT " pts=%" G_GUINT64_FORMAT "\n",
-                queue->dropped_waiting, packet->pts);
+        if (queue->dropped_waiting == 1 || queue->dropped_waiting % 30 == 0)
+            fprintf(stderr, "[BRIDGE-DROP] track=video reason=waiting_for_keyframe dropped=%"
+                    G_GUINT64_FORMAT " pts=%" G_GUINT64_FORMAT "\n",
+                    queue->dropped_waiting, packet->pts);
         g_mutex_unlock(&queue->mutex);
         packet_free(packet);
         return TRUE;
@@ -187,7 +190,7 @@ static gboolean queue_push(PacketQueue *queue, Packet *packet)
         }
         media_age += packet->duration;
     }
-    gboolean overflow = g_queue_get_length(&queue->packets) >= 2 ||
+    gboolean overflow = g_queue_get_length(&queue->packets) >= NATIVE_QUEUE_SAFETY_PACKETS ||
         media_age > (queue->video ? VIDEO_HARD_NS : AUDIO_HARD_NS);
     if (overflow) {
         guint dropped = g_queue_get_length(&queue->packets);
@@ -204,13 +207,27 @@ static gboolean queue_push(PacketQueue *queue, Packet *packet)
         }
         packet->flags |= FLAG_DISCONT;
         queue->discontinuities++;
-        fprintf(stderr, "[BRIDGE-DROP] track=%s reason=queue_overflow dropped=%u latest_pts=%"
-                G_GUINT64_FORMAT " discont=1\n", queue->name, dropped, packet->pts);
+        if (queue->video) {
+            fprintf(stderr, "[BRIDGE-DROP] track=video reason=queue_overflow dropped=%u latest_pts=%"
+                    G_GUINT64_FORMAT " discont=1\n", dropped, packet->pts);
+        } else {
+            gint64 now_us = g_get_monotonic_time();
+            if (queue->last_audio_overflow_log_us == 0 ||
+                now_us - queue->last_audio_overflow_log_us >= G_TIME_SPAN_SECOND) {
+                queue->last_audio_overflow_log_us = now_us;
+                fprintf(stderr, "[BRIDGE-DROP] track=audio reason=queue_overflow dropped=%u total_dropped=%"
+                        G_GUINT64_FORMAT " latest_pts=%" G_GUINT64_FORMAT " discont=1\n",
+                        dropped, queue->dropped_overflow, packet->pts);
+            }
+        }
     }
     if (queue->video && queue->waiting_for_keyframe) {
         queue->waiting_for_keyframe = FALSE;
         packet->flags |= FLAG_DISCONT;
         queue->discontinuities++;
+        fprintf(stderr, "[BRIDGE-RECOVERY] track=video keyframe_pts=%" G_GUINT64_FORMAT
+                " discont=1 dropped=%" G_GUINT64_FORMAT "\n",
+                packet->pts, queue->dropped_overflow + queue->dropped_waiting);
     }
     g_queue_push_tail(&queue->packets, packet);
     g_cond_signal(&queue->ready);
@@ -480,6 +497,11 @@ static gboolean push_packet(
 
     GstFlowReturn result = gst_app_src_push_buffer(GST_APP_SRC(source), buffer);
     if (result != GST_FLOW_OK) {
+        if (g_atomic_int_get(&bridge->shutting_down) && result == GST_FLOW_FLUSHING) {
+            fprintf(stderr, "[BRIDGE] track=%s flow=FLUSHING during shutdown\n",
+                    packet->type == PACKET_VIDEO ? "video" : "audio");
+            return TRUE;
+        }
         fprintf(stderr, "appsrc rejected %s buffer: %s\n",
                 packet->type == PACKET_VIDEO ? "video" : "audio",
                 gst_flow_get_name(result));
@@ -724,19 +746,38 @@ static gboolean self_test_stall(uint8_t blocked_track)
         passed &= wait_emitted(live, i + 1);
     }
     if (blocked_track == PACKET_AUDIO) {
-        for (guint i = 1; i <= 3; i++)
+        for (guint i = 1; i <= 4; i++)
             passed &= queue_push(stalled, test_packet(PACKET_AUDIO, 0,
                 (uint64_t)i * 63125000, 63125000));
+        g_mutex_lock(&stalled->mutex);
+        passed &= stalled->dropped_overflow == 0;
+        passed &= g_queue_get_length(&stalled->packets) == 4;
+        guint64 queued_audio_ns = 0;
+        for (GList *node = stalled->packets.head; node != NULL; node = node->next)
+            queued_audio_ns += ((Packet *)node->data)->duration;
+        passed &= queued_audio_ns == 252500000;
+        g_mutex_unlock(&stalled->mutex);
+        passed &= queue_push(stalled, test_packet(PACKET_AUDIO, 0, 315625000, 63125000));
     } else {
-        for (guint i = 1; i <= 4; i++)
+        passed &= queue_push(stalled, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 100000000, 0));
+        for (guint i = 2; i <= 6; i++)
             passed &= queue_push(stalled, test_packet(PACKET_VIDEO, 0,
-                (uint64_t)i * 33000000, 0));
-        passed &= queue_push(stalled, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 165000000, 0));
+                (uint64_t)i * 100000000, 0));
+        g_mutex_lock(&stalled->mutex);
+        passed &= stalled->dropped_overflow == 0;
+        passed &= g_queue_get_length(&stalled->packets) == 6;
+        Packet *video_oldest = g_queue_peek_head(&stalled->packets);
+        Packet *video_newest = g_queue_peek_tail(&stalled->packets);
+        passed &= video_newest->pts - video_oldest->pts == VIDEO_HARD_NS;
+        g_mutex_unlock(&stalled->mutex);
+        passed &= queue_push(stalled, test_packet(PACKET_VIDEO, 0, 700000000, 0));
+        passed &= queue_push(stalled, test_packet(PACKET_VIDEO, 0, 800000000, 0));
+        passed &= queue_push(stalled, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 900000000, 0));
     }
     g_mutex_lock(&stalled->mutex);
     passed &= g_queue_get_length(&stalled->packets) == 1;
     passed &= stalled->emitted == 0 && stalled->discontinuities == 1;
-    passed &= stalled->dropped_overflow == (blocked_track == PACKET_AUDIO ? 2 : 3);
+    passed &= stalled->dropped_overflow == (blocked_track == PACKET_AUDIO ? 4 : 7);
     passed &= stalled->dropped_waiting == (blocked_track == PACKET_AUDIO ? 0 : 1);
     g_mutex_unlock(&stalled->mutex);
 
@@ -748,7 +789,7 @@ static gboolean self_test_stall(uint8_t blocked_track)
     g_mutex_lock(&consumer.mutex);
     passed &= consumer.counts[blocked_track] == 2 && consumer.counts[live_track] == 5;
     passed &= consumer.last_pts[blocked_track] ==
-        (blocked_track == PACKET_AUDIO ? 189375000 : 165000000);
+        (blocked_track == PACKET_AUDIO ? 315625000 : 900000000);
     passed &= (consumer.last_flags[blocked_track] & FLAG_DISCONT) != 0;
     if (blocked_track == PACKET_VIDEO)
         passed &= (consumer.last_flags[blocked_track] & FLAG_KEYFRAME) != 0;
@@ -756,10 +797,12 @@ static gboolean self_test_stall(uint8_t blocked_track)
     g_mutex_lock(&stalled->mutex);
     passed &= g_queue_is_empty(&stalled->packets);
     g_mutex_unlock(&stalled->mutex);
-    passed &= queue_push(stalled, test_packet(blocked_track, FLAG_KEYFRAME, 252500000, 63125000));
+    passed &= queue_push(stalled, test_packet(blocked_track, FLAG_KEYFRAME,
+        blocked_track == PACKET_AUDIO ? 378750000 : 1000000000, 63125000));
     passed &= wait_emitted(stalled, 3);
     g_mutex_lock(&consumer.mutex);
-    passed &= consumer.last_pts[blocked_track] == 252500000;
+    passed &= consumer.last_pts[blocked_track] ==
+        (blocked_track == PACKET_AUDIO ? 378750000 : 1000000000);
     passed &= (consumer.last_flags[blocked_track] & FLAG_DISCONT) == 0;
     g_mutex_unlock(&consumer.mutex);
     queue_stop(&bridge.audio_queue);
@@ -782,31 +825,48 @@ static int self_test_queues(void)
     queue_init(&video, "video-test", TRUE);
     gboolean passed = TRUE;
 
-    /* Stall audio consumption until the bounded queue overflows. */
+    /* Four complete blocks fit below the 280 ms audio hard limit. */
     passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 0, 63125000));
     passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 63125000, 63125000));
     passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 126250000, 63125000));
-    passed &= audio.dropped_overflow == 2 && audio.discontinuities == 1;
-    passed &= expect_packet(&audio, 126250000, TRUE);
     passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 189375000, 63125000));
-    passed &= expect_packet(&audio, 189375000, FALSE);
+    passed &= audio.dropped_overflow == 0 && g_queue_get_length(&audio.packets) == 4;
+    guint64 audio_age_ns = 0;
+    for (GList *node = audio.packets.head; node != NULL; node = node->next)
+        audio_age_ns += ((Packet *)node->data)->duration;
+    passed &= audio_age_ns == 252500000;
+    /* The fifth block crosses 280 ms: retain only it at its source PTS. */
+    passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 252500000, 63125000));
+    passed &= audio.dropped_overflow == 4 && audio.discontinuities == 1;
+    passed &= g_queue_get_length(&audio.packets) == 1;
+    passed &= expect_packet(&audio, 252500000, TRUE);
+    passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 315625000, 63125000));
+    passed &= expect_packet(&audio, 315625000, FALSE);
 
-    /* Overflow drops the entire queued GOP and waits for a keyframe. */
+    /* A video span through 500 ms is accepted; the next delta drops that GOP. */
     passed &= queue_push(&video, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 0, 0));
-    passed &= queue_push(&video, test_packet(PACKET_VIDEO, 0, 33000000, 0));
-    passed &= queue_push(&video, test_packet(PACKET_VIDEO, 0, 66000000, 0));
-    passed &= queue_push(&video, test_packet(PACKET_VIDEO, 0, 99000000, 0));
-    passed &= queue_push(&video, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 132000000, 0));
-    passed &= video.dropped_overflow == 3 && video.dropped_waiting == 1;
-    passed &= expect_packet(&video, 132000000, TRUE);
+    for (guint i = 1; i <= 5; i++)
+        passed &= queue_push(&video, test_packet(PACKET_VIDEO, 0, (uint64_t)i * 100000000, 0));
+    passed &= video.dropped_overflow == 0 && g_queue_get_length(&video.packets) == 6;
+    Packet *video_oldest = g_queue_peek_head(&video.packets);
+    Packet *video_newest = g_queue_peek_tail(&video.packets);
+    passed &= video_newest->pts - video_oldest->pts == VIDEO_HARD_NS;
+    passed &= queue_push(&video, test_packet(PACKET_VIDEO, 0, 600000000, 0));
+    passed &= video.dropped_overflow == 7 && video.waiting_for_keyframe;
+    passed &= queue_push(&video, test_packet(PACKET_VIDEO, 0, 700000000, 0));
+    passed &= video.dropped_waiting == 1;
+    passed &= queue_push(&video, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 800000000, 0));
+    passed &= expect_packet(&video, 800000000, TRUE);
+    passed &= queue_push(&video, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 900000000, 0));
+    passed &= expect_packet(&video, 900000000, FALSE);
 
     /* A video stall and its recovery do not block or erase audio. */
-    passed &= queue_push(&video, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 165000000, 0));
-    passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 252500000, 63125000));
-    passed &= expect_packet(&audio, 252500000, FALSE);
-    passed &= expect_packet(&video, 165000000, FALSE);
-    passed &= !queue_push(&audio, test_packet(PACKET_AUDIO, 0, 252500000, 63125000));
-    passed &= audio.rejected_pts == 1 && audio.ingress == 6;
+    passed &= queue_push(&video, test_packet(PACKET_VIDEO, FLAG_KEYFRAME, 1000000000, 0));
+    passed &= queue_push(&audio, test_packet(PACKET_AUDIO, 0, 378750000, 63125000));
+    passed &= expect_packet(&audio, 378750000, FALSE);
+    passed &= expect_packet(&video, 1000000000, FALSE);
+    passed &= !queue_push(&audio, test_packet(PACKET_AUDIO, 0, 378750000, 63125000));
+    passed &= audio.rejected_pts == 1 && audio.ingress == 8;
 
     queue_destroy(&audio);
     queue_destroy(&video);

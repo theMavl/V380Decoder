@@ -1,9 +1,9 @@
 .git
-captures
-**/bin
-**/obj
-artifacts
-**/__pycache__
-CODEX
 .env
 .env.*
+captures
+CODEX
+artifacts
+**/bin
+**/obj
+**/__pycache__
